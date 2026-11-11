@@ -7,19 +7,41 @@ local Store = {
 	byId = {},
 	projectsById = {},
 	applied = 0,
+	-- Model lists by machine ("" for this one). The bridge sends them only when they
+	-- change (we report modelsHash in the hello), so they outlive each snapshot.
+	models = {},
+	modelsHash = "",
+	-- What the bridge last sent for the parts it may leave out of an update. We report
+	-- them in the hello, so a snapshot that omits them is still complete for us.
+	listKey = "",
+	projectsKey = "",
+	viewKey = "",
 }
 ns.Store = Store
 
+-- As T3 Code's sidebar: a thread that needs you (an answer, an approval, a plan to
+-- review) is listed with Open at the top, and Working holds only what's running or
+-- waiting on something else.
 local GROUP_OF = {
-	working = "working", input = "working", plan = "working",
-	open = "open", failed = "open",
+	working = "working", waiting = "working",
+	input = "open", plan = "open", open = "open", failed = "open",
+	snoozed = "snoozed",
 	settled = "settled",
 }
 Store.GROUP_OF = GROUP_OF
 
 function Store:Apply(data)
+	local prev = self.data
+	-- A snapshot may leave out the transcript (60 KB) and the project list when the
+	-- bridge knows, from our hello, that we already hold them. `same` names the parts
+	-- it left out; a part that is neither sent nor named is empty now (no thread
+	-- selected, no projects). Keeping the old table costs nothing: the next full
+	-- snapshot replaces it.
+	local same = type(data.same) == "string" and data.same or ""
+	local sentProjects, sentView = data.projects ~= nil, data.view ~= nil
 	data.threads = data.threads or {}
-	data.projects = data.projects or {}
+	data.projects = data.projects or (same:find("p", 1, true) and prev.projects) or {}
+	if not data.view and same:find("v", 1, true) then data.view = prev.view end
 	data.usage = data.usage or {}
 	data.bridge = data.bridge or {}
 	local before = self.byId
@@ -28,6 +50,41 @@ function Store:Apply(data)
 	for _, p in ipairs(data.projects) do projectsById[p.id] = p end
 	self.data, self.byId, self.projectsById = data, byId, projectsById
 	self.applied = self.applied + 1
+	if type(data.x) == "table" then
+		-- Only record the hash of a part this snapshot actually carried: the bridge's
+		-- hash describes what it sent, and a part it left out is still the old one.
+		-- A part that was neither sent nor kept is gone, so claim nothing for it.
+		self.listKey = data.x.l ~= nil and tostring(data.x.l) or self.listKey
+		if sentProjects then
+			self.projectsKey = tostring(data.x.p or "")
+		elseif not same:find("p", 1, true) then
+			self.projectsKey = ""
+		end
+		if sentView then
+			self.viewKey = tostring(data.x.v or "")
+		elseif not same:find("v", 1, true) then
+			self.viewKey = ""
+		end
+	else
+		-- An older bridge sends everything in every snapshot, so a new one is a new
+		-- version of both parts.
+		self.listKey, self.projectsKey, self.viewKey = "gen:" .. self.applied, "gen:" .. self.applied, "gen:" .. self.applied
+	end
+	if type(data.models) == "table" and type(data.models.g) == "table" then
+		-- Flattened per machine, in T3's order: { i, s, l, p = provider, r = levels }.
+		local models = {}
+		for _, g in ipairs(data.models.g) do
+			local list = {}
+			for _, p in ipairs(type(g.p) == "table" and g.p or {}) do
+				for _, m in ipairs(type(p.m) == "table" and p.m or {}) do
+					local levels = m.r and g.x and g.x[m.r]
+					table.insert(list, { i = p.i, s = m.s, l = m.l, p = p.n or p.i, r = type(levels) == "table" and levels or nil })
+				end
+			end
+			models[g.e or ""] = list
+		end
+		self.models, self.modelsHash = models, tostring(data.models.h or "")
+	end
 
 	if self.applied > 1 then
 		for id, t in pairs(byId) do
@@ -55,7 +112,7 @@ end
 -- Threads grouped for the sidebar, filtered by project.
 -- projectFilter: "all", a project id, or "m:<machine>" ("m:local" for this one).
 function Store:Groups(projectFilter, query)
-	local groups = { working = {}, open = {}, settled = {} }
+	local groups = { working = {}, open = {}, snoozed = {}, settled = {} }
 	local machine = projectFilter and projectFilter:match("^m:(.+)$")
 	for _, t in ipairs(self.data.threads) do
 		local match
@@ -78,9 +135,131 @@ end
 function Store:Active()
 	local list = {}
 	for _, t in ipairs(self.data.threads) do
-		if t.s == "working" or t.s == "input" or t.s == "plan" then table.insert(list, t) end
+		if t.s == "working" or t.s == "input" or t.s == "plan" or t.s == "waiting" then table.insert(list, t) end
 	end
 	return list
+end
+
+---------------------------------------------------------------------------
+-- Models
+
+-- A model's key: instance and slug joined by a tab, as the bridge writes them.
+function Store.ModelKey(instanceId, slug)
+	if not instanceId or not slug then return nil end
+	return instanceId .. "\t" .. slug
+end
+
+function Store.SplitModelKey(key)
+	return (key or ""):match("^(.-)\t(.+)$")
+end
+
+-- The machine a thread or project id belongs to: the bridge prefixes other
+-- machines' ids with their code and "~" ("" for this one).
+function Store.EnvOf(id)
+	return id and id:match("^([^~]+)~") or ""
+end
+
+local function Find(self, env, key)
+	if not key then return nil end
+	for _, m in ipairs(self.models[env or ""] or {}) do
+		if Store.ModelKey(m.i, m.s) == key then return m end
+	end
+end
+
+function Store:Offers(env, key)
+	return Find(self, env, key) ~= nil
+end
+
+local DIM = "|cff9d9d9d"
+
+-- "Name · Provider", with the provider dimmed when `dim` is set.
+function Store:ModelLabel(env, key, dim)
+	local m = Find(self, env, key)
+	if not m then return select(2, Store.SplitModelKey(key)) end
+	if dim then return m.l .. DIM .. " · " .. m.p .. "|r" end
+	return m.l .. " · " .. m.p
+end
+
+-- Choices for a model picker on machine `env`, in groups under header rows: the
+-- models its latest threads used first (a short reach on a controller), then each
+-- provider's models in T3's order. `current` is listed even when it's no longer
+-- offered (a legacy model, say). Rows inside a provider group show just the model;
+-- the button always shows the provider too.
+function Store:ModelOptions(env, current)
+	local list = self.models[env or ""]
+	if not list or #list == 0 then return nil end
+	local options = {}
+	local function item(m, group, withProvider)
+		local key = Store.ModelKey(m.i, m.s)
+		local text = m.l .. DIM .. " · " .. m.p .. "|r"
+		table.insert(options, { value = key, label = withProvider and text or m.l, text = text, group = group })
+	end
+	local recent, seen = {}, {}
+	if current and not Find(self, env, current) then
+		local slug = select(2, Store.SplitModelKey(current))
+		table.insert(recent, { value = current, label = slug, text = slug, group = "Recent" })
+	end
+	local byRecent = {}
+	for _, t in ipairs(self.data.threads) do
+		if t.mi and t.m and Store.EnvOf(t.id) == (env or "") then table.insert(byRecent, t) end
+	end
+	table.sort(byRecent, function(a, b) return (a.st or a.u or 0) > (b.st or b.u or 0) end)
+	local recentModels = {}
+	for _, t in ipairs(byRecent) do
+		if #recentModels >= 4 then break end
+		local key = Store.ModelKey(t.mi, t.m)
+		local m = Find(self, env, key)
+		if m and not seen[key] then
+			seen[key] = true
+			table.insert(recentModels, m)
+		end
+	end
+	if #recent + #recentModels > 0 then
+		table.insert(options, { header = true, label = "Recent" })
+		for _, o in ipairs(recent) do table.insert(options, o) end
+		for _, m in ipairs(recentModels) do item(m, "Recent", true) end
+	end
+	local provider
+	for _, m in ipairs(list) do
+		if m.p ~= provider then
+			provider = m.p
+			table.insert(options, { header = true, label = provider })
+		end
+		item(m, provider, false)
+	end
+	return options
+end
+
+-- A model's reasoning levels as picker choices, plus the one T3 uses by default.
+-- nil when the model has none.
+function Store:EffortOptions(env, key)
+	local m = Find(self, env, key)
+	local levels = m and m.r
+	if not levels or type(levels.o) ~= "table" or #levels.o == 0 then return nil end
+	local options = {}
+	for _, o in ipairs(levels.o) do table.insert(options, { value = o.i, label = o.l or o.i }) end
+	return options, levels.d
+end
+
+-- The level the latest active thread on machine `env` used with model `key`, which
+-- the bridge carries over when that model is picked without a level (nil: the
+-- model's own).
+function Store:LastEffort(env, key)
+	local best
+	for _, t in ipairs(self.data.threads) do
+		if Store.EnvOf(t.id) == (env or "") and Store.ModelKey(t.mi, t.m) == key
+			and (not best or (t.st or t.u or 0) > (best.st or best.u or 0)) then
+			best = t
+		end
+	end
+	return best and best.re
+end
+
+function Store.HasOption(options, value)
+	for _, o in ipairs(options or {}) do
+		if not o.header and o.value == value then return true end
+	end
+	return false
 end
 
 function Store:View()
@@ -92,12 +271,12 @@ end
 -- Status words and colors
 
 local STATUS_TEXT = {
-	working = "Working", input = "Waiting", plan = "Plan ready",
-	open = "Finished", failed = "Failed", settled = "Settled",
+	working = "Working", input = "Needs you", plan = "Plan ready", waiting = "Waiting",
+	open = "Finished", failed = "Failed", snoozed = "Snoozed", settled = "Settled",
 }
 local STATUS_COLOR = {
-	working = "blue", input = "orange", plan = "orange",
-	open = "white", failed = "red", settled = "grey",
+	working = "blue", input = "orange", plan = "orange", waiting = "grey",
+	open = "white", failed = "red", snoozed = "grey", settled = "grey",
 }
 
 function Store.StatusText(s)

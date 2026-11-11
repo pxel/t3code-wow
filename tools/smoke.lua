@@ -57,6 +57,10 @@ chunk()
 local data = T3Code_Inbox
 T3Code_Inbox = nil
 data.ack = { ui = ns.ui, seq = ns.Transport.stripSeq }
+-- The harness edits the snapshot in place, so its hashes (x) would no longer describe
+-- what it carries. Without them every snapshot counts as complete, as an older bridge's
+-- did; the test below drives the "this part is unchanged" path with its own hashes.
+data.x = nil
 data.gen = data.gen + 1
 data.nextSig = sig + 1
 ns.Transport:Apply(data)
@@ -75,12 +79,100 @@ check(#rows > 0, "transcript rendered " .. #rows .. " elements")
 local listRows = ns.ThreadList.scrollBox._rows or {}
 check(#listRows > 0, "thread list rendered " .. #listRows .. " rows")
 
+-- A snapshot may leave out the transcript and the project list when the bridge knows,
+-- from the hello, that this addon already has them. It names them in `same`.
+do
+	local view = ns.Store.data.view
+	local projects = ns.Store.data.projects
+	data.gen = data.gen + 1
+	ns.Transport:Apply({
+		gen = data.gen, x = { l = "L1", p = "P1", v = "V1" },
+		threads = ns.Store.data.threads, projects = projects, view = view,
+		bridge = ns.Store.data.bridge, usage = ns.Store.data.usage,
+		ack = { ui = ns.ui, seq = ns.Transport.stripSeq },
+	})
+	check(ns.Store.listKey == "L1" and ns.Store.projectsKey == "P1" and ns.Store.viewKey == "V1", "the addon records what it applied")
+	rows = ns.Transcript.scrollBox._rows or {}
+	local dpBefore = ns.Transcript.dp
+	data.gen = data.gen + 1
+	ns.Transport:Apply({
+		gen = data.gen, same = "pv", x = { l = "L2", p = "P2", v = "V2" },
+		threads = ns.Store.data.threads, bridge = ns.Store.data.bridge, usage = ns.Store.data.usage,
+		ack = { ui = ns.ui, seq = ns.Transport.stripSeq },
+	})
+	check(ns.Store.data.view == view, "an omitted transcript is kept")
+	check(ns.Store.data.projects == projects, "an omitted project list is kept")
+	check(ns.Store.listKey == "L2" and ns.Store.projectsKey == "P1" and ns.Store.viewKey == "V1", "it only claims the parts it was sent")
+	check(ns.Transport:Payload():find("\031L2\031P1\031V1", 1, true) ~= nil, "the hello reports what it holds")
+	check(#(ns.Transcript.scrollBox._rows or {}) == #rows and ns.Transcript.dp == dpBefore, "the transcript isn't rebuilt for an unchanged one")
+
+	-- Dropping the transcript must drop the hash too, and tell the bridge, or it would
+	-- think the addon still has it and never send it again (Back, then the same thread).
+	data.gen = data.gen + 1
+	ns.Transport:Apply({
+		gen = data.gen, x = { l = "L3", p = "P1", v = "" },
+		threads = ns.Store.data.threads, projects = ns.Store.data.projects,
+		bridge = ns.Store.data.bridge, usage = ns.Store.data.usage,
+		ack = { ui = ns.ui, seq = ns.Transport.stripSeq },
+	})
+	check(ns.Store.data.view == nil and ns.Store.viewKey == "", "a dropped transcript is not claimed")
+
+	-- Settling or reopening a thread changes the rows (quick replies) without the
+	-- transcript changing, so its hash alone can't decide a redraw.
+	ns.Store:Apply({
+		x = { l = "L4", p = "P1", v = "V1" }, same = "v",
+		threads = ns.Store.data.threads, projects = ns.Store.data.projects, bridge = ns.Store.data.bridge, usage = ns.Store.data.usage,
+	})
+	local dp = ns.Transcript.dp
+	local thread = ns.Store:Thread(ns.viewId)
+	local was = thread.s
+	thread.s = was == "open" and "settled" or "open"
+	ns.Store:Apply({
+		x = { l = "L5", p = "P1", v = "V1" }, same = "v",
+		threads = ns.Store.data.threads, projects = ns.Store.data.projects, bridge = ns.Store.data.bridge, usage = ns.Store.data.usage,
+	})
+	check(ns.Transcript.dp ~= dp, "a status change still redraws the transcript")
+	thread.s = was
+	-- Back to a complete snapshot for the rest of the checks.
+	ns.Store:Apply(data)
+end
+
 -- Send a message: queued, echoed, and present in the strip payload.
+-- A message too long for one frame would never go and would hold up the queue behind it.
+do
+	local queued = #ns.Transport.queue
+	ns.Main.composer._text = string.rep("x", 2300)
+	ns.Main:Send()
+	check(#ns.Transport.queue == queued and #ns.Main.composer._text == 2300, "a message too long for the strip is refused, and the composer keeps it")
+	ns.Main.composer._text = string.rep("x", 1900)
+	ns.Main:Send()
+	check(#ns.Transport.queue == queued + 1, "a long message that fits still goes")
+	table.remove(ns.Transport.queue)
+	ns.Transcript.echo[ns.viewId] = nil
+end
 ns.Main.composer._text = "Please run the tests"
 ns.Main:Send()
 check(#ns.Transport.queue >= 1, "command queued")
 check(ns.Transport:Payload():find("Please run the tests", 1, true) ~= nil, "message in strip payload")
+check(ns.Transport.queue[#ns.Transport.queue].args[3] == "steer", "follow-ups ask to steer by default")
+ns.db.settings.steerFollowUps = false
+ns.Main:Send("And the linter")
+check(ns.Transport.queue[#ns.Transport.queue].args[3] == nil, "with steering off, a follow-up names no mode, so the bridge queues it")
+ns.db.settings.steerFollowUps = true
 check(ns.Transcript.echo[ns.viewId] ~= nil, "local echo shown")
+-- The bridge reformats what you sent (markdown, escapes); the echo still goes when it arrives.
+do
+	local v = ns.Store.data.view
+	if v and v.id == ns.viewId then
+		local last = 0
+		for _, m in ipairs(v.msgs or {}) do last = math.max(last, m.at or 0) end
+		-- T3 Code renumbers its bounded window, so the new message can have a lower number.
+		table.insert(v.msgs, { r = "u", t = "|cffa8c7fa  reformatted|r", at = last + 1, n = 1 })
+		ns.Transcript:Refresh(true)
+		check(ns.Transcript.echo[ns.viewId] == nil, "local echo dropped once the sent message arrives, reformatted")
+		table.remove(v.msgs)
+	end
+end
 
 -- Pages
 ns.Main:ShowPage("usage")
@@ -91,12 +183,99 @@ check(true, "pages switch")
 -- New thread flow
 ns.Main:StartNewThread()
 check(ns.Main.mode == "new" and ns.Main.newProject ~= nil, "new thread mode with project " .. tostring(ns.Main.newProject))
+local hdr = ns.Main.frame.Pages.threads.Right.Header
+check(ns.Transport:Payload():find(ns.Store.modelsHash, 1, true) ~= nil and ns.Store.modelsHash ~= "", "hello reports the model list it has: " .. ns.Store.modelsHash)
+local function Choices(dd)
+	local list = {}
+	for _, o in ipairs(dd.options) do if not o.header then table.insert(list, o) end end
+	return list
+end
+local groups = {}
+for _, o in ipairs(hdr.Model.options) do if o.header then table.insert(groups, o.label) end end
+check(hdr.Model:IsShown() and #Choices(hdr.Model) >= 1, "model picker shown for a new thread: " .. #Choices(hdr.Model) .. " models")
+check(hdr.Model.options[1].header and #groups >= 2, "models grouped under headers: " .. table.concat(groups, ", "))
+check(hdr.Model.Text:GetText():find(" · ", 1, true) ~= nil, "the button names the provider: " .. hdr.Model.Text:GetText())
+do
+	-- A search for a provider keeps its header and its models; headers aren't choices.
+	local provider = groups[#groups]
+	ns.UI.OpenList(hdr.Model)
+	local l = ns.UI.ListOpen()
+	l.Search:SetText(provider:lower())
+	ns.UI.RefreshList()
+	local at, others
+	for n, o in ipairs(l.filtered) do
+		if o.header and o.label == provider then at = n end
+		-- Another provider's model may match on its own name ("GPT-5 Codex" under OpenCode, say).
+		if not o.header and o.group ~= provider and o.group ~= "Recent" and not o.label:lower():find(provider:lower(), 1, true) then others = true end
+	end
+	check(at and l.filtered[at + 1] and not l.filtered[at + 1].header and not others, "searching a provider's name lists its models under its header")
+	l:Hide()
+end
+do
+	local seq = ns.Transport.stripSeq
+	ns.Transport:Apply({ gen = data.gen + 1, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, models = { h = "00000000", g = {} } })
+	check(ns.Transport.stripSeq ~= seq and ns.Transport:Payload():find("00000000", 1, true) ~= nil, "a new model list is announced straight away")
+	check(ns.Store:ModelOptions("", nil) == nil, "an empty list clears the models")
+	check(not hdr.Model:IsShown() and not hdr.Effort:IsShown(), "no models: neither picker is left on screen")
+	data.gen = data.gen + 1
+	ns.Transport:Apply({ gen = data.gen + 1, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, models = data.models })
+	data.gen = data.gen + 1
+	check(hdr.Model:IsShown(), "the list comes back")
+end
+check(ns.Main:ChosenNewModel() == nil and ns.Main:NewThreadModel() ~= nil, "no pick yet: the picker shows T3's default but sends none")
+-- Pick the last model that has reasoning levels (any model when none has).
+local pick
+for _, o in ipairs(Choices(hdr.Model)) do
+	if not pick or ns.Store:EffortOptions("", o.value) then pick = o end
+end
+ns.Main:PickModel(pick.value)
+check(ns.db.models[ns.Main.newProject] == pick.value and ns.Main:NewThreadModel() == pick.value, "picked model remembered for the project: " .. pick.label)
+local level
+if hdr.Effort:IsShown() then
+	local levels, default = ns.Store:EffortOptions("", pick.value)
+	for _, o in ipairs(levels) do if o.value ~= default then level = o.value end end
+	local proj = ns.Store.projectsById[ns.Main.newProject]
+	local inherited = (proj.dm == pick.value and proj.de) or ns.Store:LastEffort("", pick.value) or default
+	check(ns.Main:ChosenNewEffort() == nil and hdr.Effort.value == inherited, "no level picked: the picker shows the level the thread would get: " .. inherited)
+	ns.Main:PickEffort(level)
+	check(ns.db.efforts[ns.Main.newProject] == level and hdr.Effort.value == level, "picked level remembered for the project: " .. level)
+else
+	check(false, "the reasoning picker shows for " .. pick.label)
+end
 ns.Main.composer._text = "Build a thing"
 ns.Main:Send()
 check(ns.Transport:Payload():find("\031new\031", 1, true) ~= nil, "new-thread command in payload")
+local pickI, pickS = ns.Store.SplitModelKey(pick.value)
+check(ns.Transport:Payload():find("Build a thing\031" .. pickI .. "\031" .. pickS .. (level and ("\031" .. level) or ""), 1, true) ~= nil, "picked model and level ride along with the new thread")
 ns.Transport:Apply({ gen = data.gen + 2, results = { { id = ns.Main.pendingNew, ok = true, open = firstThread.id } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
 check(ns.Main.mode == "thread" and ns.viewId == firstThread.id, "result opened the new thread")
 check(#ns.Transport.queue == 0, "all commands acknowledged")
+check(hdr.Model:IsShown(), "model picker shown for an open thread")
+local cur = ns.Main:ThreadModel(ns.Store:Thread(ns.viewId))
+local other
+for _, o in ipairs(Choices(hdr.Model)) do if o.value ~= cur then other = o break end end
+if other then
+	ns.Main:PickModel(other.value)
+	local oi, os_ = ns.Store.SplitModelKey(other.value)
+	check(ns.Transport:Payload():find("\031model\031" .. ns.viewId .. "\031" .. oi .. "\031" .. os_, 1, true) ~= nil, "switching a thread's model sends model")
+	check(hdr.Model.value == other.value, "the picker shows the new model straight away")
+	ns.Transport:Apply({ gen = data.gen + 3, results = { { id = ns.Main.pendingModel.cmd, ok = false, msg = "Codex is switched off in T3 Code. Pick another model." } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
+	check(ns.Main.pendingModel == nil and hdr.Model.value == cur, "a refused switch puts the picker back")
+end
+do
+	local t = ns.Store:Thread(ns.viewId)
+	local levels = ns.Store:EffortOptions(ns.Store.EnvOf(t.id), ns.Store.ModelKey(t.mi, t.m))
+	check(hdr.Effort:IsShown() == (levels ~= nil), "the reasoning picker shows when the thread's model has levels")
+	if levels then
+		local next
+		for _, o in ipairs(levels) do if o.value ~= hdr.Effort.value then next = o.value break end end
+		ns.Main:PickEffort(next)
+		check(ns.Transport:Payload():find("\031model\031" .. ns.viewId .. "\031" .. t.mi .. "\031" .. t.m .. "\031" .. next, 1, true) ~= nil, "changing a thread's level sends model with it")
+		check(hdr.Effort.value == next, "the picker shows the new level straight away")
+		ns.Transport:Apply({ gen = data.gen + 4, results = { { id = ns.Main.pendingEffort.cmd, ok = false, msg = "That level is gone." } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
+		check(ns.Main.pendingEffort == nil and hdr.Effort.value ~= next, "a refused level puts the picker back")
+	end
+end
 
 -- Question / approval rendering
 data.gen = data.gen + 10
@@ -127,6 +306,38 @@ data.dict = { n = os.time() * 1000 + 5, state = "done", text = "pasted words" }
 ns.Transport:Apply(data)
 check(ns.Main.composer._text == "already pasted words", "text the backend already pasted isn't added again")
 ns.Main.composer._text = ""
+
+-- A desktop with no dictation backend (macOS today): the mic says why and sends nothing.
+data.bridge.dictation = nil
+data.bridge.dictationHint = "Dictation isn't available on macOS yet."
+data.gen = data.gen + 1
+ns.Transport:Apply(data)
+Stub.printed = {}
+local queued = #ns.Transport.queue
+ns.Main.dictating = false
+ns.Main.dictNoteAt = nil
+ns.Main:ToggleDictation()
+check(not ns.Main.dictating and #ns.Transport.queue == queued, "no dictation backend: nothing is sent")
+check(Stub.printed[1] and Stub.printed[1]:find("macOS", 1, true) ~= nil, "the mic explains why: " .. tostring(Stub.printed[1]))
+ns.Main:ToggleDictation()
+check(#Stub.printed == 1, "a repeated press doesn't repeat the note")
+ns.Main:Open()
+ns.Main:Refresh()
+check(not ns.Main.frame.Bar.Mic:IsEnabled(), "the mic is dimmed while there is no backend")
+data.bridge.dictation = "test backend"
+data.bridge.dictationHint = nil
+data.gen = data.gen + 1
+ns.Transport:Apply(data)
+ns.Main:Refresh()
+check(ns.Main.frame.Bar.Mic:IsEnabled(), "the mic is ready again once a backend is reported")
+
+-- A refused dictate command doesn't leave the mic stuck on.
+ns.Main.dictating = false
+ns.Main:ToggleDictation()
+check(ns.Main.dictating, "dictation starts when a backend is reported")
+data.gen = data.gen + 1
+ns.Transport:Apply({ gen = data.gen, results = { { id = ns.Main.dictCmd, ok = false, msg = "no microphone" } }, threads = data.threads, projects = data.projects, bridge = data.bridge, usage = data.usage, ack = { ui = ns.ui, seq = ns.Transport.stripSeq } })
+check(not ns.Main.dictating, "a refused dictate command puts the mic back")
 
 -- Plan, approval details, run summary, queued note
 data.gen = data.gen + 1
@@ -248,6 +459,38 @@ check(f._scripts.OnGamePadStick(f, "Left", 0, -1) == false, "left stick consumed
 check(down(f, "PADFORWARD") == false and f._shown == false and not ns.Gamepad.capturing, "Start closes the window and gives the controller back")
 ns.Main:Open()
 check(ns.Gamepad.capturing, "reopened window takes the controller again")
+-- The model picker sits on the header row: D-pad to it, A opens its list, B closes it.
+do
+	local prevView = ns.viewId
+	ns.Main:StartNewThread()
+	ns.Gamepad:Highlight(hdr.Project)
+	down(f, "PADDRIGHT")
+	check(ns.Gamepad.selected == hdr.Model, "Right from the project goes to the model picker")
+	down(f, "PAD1")
+	local l = ns.UI.ListOpen()
+	check(l ~= nil and l.owner == hdr.Model, "A opens the model list")
+	local rows, onHeader = 0, false
+	for _, c in ipairs(ns.Gamepad:Candidates()) do
+		rows = rows + 1
+		if c.ed and c.ed.header then onHeader = true end
+	end
+	check(rows > 0 and not onHeader, "the D-pad skips group headers in the list: " .. rows .. " rows")
+	down(f, "PAD2")
+	check(ns.UI.ListOpen() == nil and f._shown, "B closes the model list, not the window")
+	if hdr.Effort:IsShown() then
+		down(f, "PADDRIGHT")
+		check(ns.Gamepad.selected == hdr.Effort, "Right from the model goes to the reasoning picker")
+		down(f, "PAD1")
+		local open = ns.UI.ListOpen()
+		check(open ~= nil and open.owner == hdr.Effort, "A opens the reasoning list")
+		down(f, "PAD2")
+		down(f, "PADDLEFT")
+		check(ns.Gamepad.selected == hdr.Model, "Left from the reasoning picker goes back to the model")
+	end
+	down(f, "PADDLEFT")
+	check(ns.Gamepad.selected == hdr.Project, "Left goes back to the project")
+	ns.Main:SelectThread(prevView)
+end
 check(down(f, "PADRSHOULDER") == false and ns.Main.page == "usage", "RB switched to usage")
 down(f, "PADLSHOULDER")
 check(ns.Main.page == "threads", "LB switched back")
@@ -421,7 +664,7 @@ do
 	check(not L.chordText:find("RT", 1, true), "no hard-coded Xbox names")
 	local w = L.watcher
 	check(w._scripts.OnGamePadButtonDown == nil and not w._gamepadEnabled, "the watcher never takes controller input")
-	local function frame() w._scripts.OnUpdate(w, 0.016) end
+	local function frame() Stub.now = Stub.now + 0.06 w._scripts.OnUpdate(w, 0.06) end
 	local wasOpen = ns.windowOpen
 	WOWSTUB.padHeld = { PADLTRIGGER = true, PADRTRIGGER = true }
 	frame()
@@ -440,6 +683,20 @@ do
 	WOWSTUB.padHeld = { PADBACK = true }
 	frame()
 	check(ns.windowOpen == wasOpen, "Back on its own is left to the game")
+	WOWSTUB.padHeld = {}
+	frame()
+
+	-- Back a moment before the triggers: with a 20 Hz read the two can land on
+	-- different frames, and the chord must still fire.
+	WOWSTUB.padHeld = { PADBACK = true }
+	frame()
+	WOWSTUB.padHeld = { PADBACK = true, PADLTRIGGER = true, PADRTRIGGER = true }
+	frame()
+	check(ns.windowOpen ~= wasOpen, "Back a moment before the triggers still opens it")
+	frame()
+	frame()
+	check(ns.windowOpen ~= wasOpen, "and holding all three doesn't toggle it again")
+	if ns.windowOpen ~= wasOpen then ns.Launcher:Open() end
 	WOWSTUB.padHeld = {}
 	frame()
 end
@@ -468,6 +725,23 @@ do
 	ns.db.settings.trackerPoint = nil
 	for _, t in ipairs(WOWSTUB.tickers) do t.fn() end
 	check(ns.Tracker.attached == "below", "reset reattaches it")
+
+	-- A link that goes stale on its own clock, with no update arriving to say so, still
+	-- reaches the tracker: the once-a-second tick notices the state changed.
+	ns.Transport.bridgeNow = time() - 1000
+	ns.Tracker:RefreshTimers()
+	local found = false
+	for _, b in ipairs(f.Lines) do
+		if b._shown and b.Title:GetText():find("Connection lost", 1, true) then found = true end
+	end
+	check(found, "the tracker says the connection was lost")
+	ns.Transport.bridgeNow = time()
+	ns.Tracker:RefreshTimers()
+	found = false
+	for _, b in ipairs(f.Lines) do
+		if b._shown and b.Title:GetText():find("Connection lost", 1, true) then found = true end
+	end
+	check(not found, "and that it is back")
 end
 
 -- Minimap button
@@ -487,6 +761,21 @@ do
 	check(mb._shown == false, "minimap button can be hidden")
 	ns.db.settings.minimapButton = true
 	ns.MinimapButton:Refresh()
+	-- Waiting on a watched PR isn't "needs you": no badge for it, but there is for input.
+	local saved = ns.Store.data.threads
+	ns.Store.data.threads = { { id = "w1", title = "Waiting", s = "waiting", l = "Watching pull request #7", st = time() - 60, p = "p" } }
+	ns.MinimapButton:Refresh()
+	check(not mb.Badge:IsShown(), "a waiting thread doesn't badge the minimap button")
+	mb._scripts.OnEnter(mb)
+	ns.Tracker:Refresh()
+	check(ns.Store.GROUP_OF.waiting == "working", "waiting threads are listed under Working")
+	check(ns.Store.GROUP_OF.input == "open" and ns.Store.GROUP_OF.plan == "open", "threads that need you are listed under Open, as in T3 Code")
+	ns.Store.data.threads[2] = { id = "i1", title = "Input", s = "input", l = "Needs your approval", p = "p" }
+	ns.MinimapButton:Refresh()
+	check(mb.Badge:IsShown(), "a thread that needs the player badges the minimap button")
+	ns.Store.data.threads = saved
+	ns.MinimapButton:Refresh()
+	ns.Tracker:Refresh()
 end
 
 -- Exhaustion

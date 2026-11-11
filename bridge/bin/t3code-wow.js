@@ -7,20 +7,23 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Bridge, STATE_DIR, VERSION } from '../src/bridge.js';
-import { CONFIG_DIR, mintToken, readToken, tokenClaims, findT3Cli } from '../src/auth.js';
+import { CONFIG_DIR, mintToken, readToken, tokenClaims, findT3Cli, t3Command } from '../src/auth.js';
 import { findWowInstalls, addonsDir as addonsDirOf, findWowProcess } from '../src/wow.js';
 import { SlotBank, ADDON, CTL_LONG } from '../src/slots.js';
-import { StripCapture } from '../src/capture.js';
+import { StripCapture, SCREEN_PERMISSION_HELP } from '../src/capture.js';
 import { decodeImage } from '../src/codec.js';
 import { identify, discoverTailscale, mintRemote, revokeRemote, saveToken, readTokenData, tokenFile } from '../src/envs.js';
+import { logonTask, supervise, stopWhenGone } from '../src/windows-service.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_ROOT = path.resolve(HERE, '..');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const UNIT_NAME = 't3code-wow.service';
-const UNIT_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'systemd/user', UNIT_NAME);
+const MAC = process.platform === 'darwin';
+const WIN = process.platform === 'win32';
 const DATA_DIR = path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local/share'), 't3code-wow');
 const BIN_LINK = path.join(os.homedir(), '.local/bin/t3code-wow');
+const BIN_SHIM = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData/Local'), 'Microsoft/WindowsApps/t3code-wow.cmd');
+const RERUN = WIN ? 'run the install command again' : 'run ./install.sh again';
 const DEFAULT_SLOTS = 1200;
 
 const C = process.stdout.isTTY
@@ -84,20 +87,123 @@ function resolveWowDir(args, cfg) {
   if (forever.length) return forever[0];
   const where = '\nIf it\'s somewhere else, pass --wow "/path/to/World of Warcraft".';
   if (wowOnly.length) {
-    throw new Error(`found World of Warcraft at ${wowOnly[0]}, but not WoW: Forever. Install Forever from Battle.net (it's a separate game version), launch it once, then run ./install.sh again.${where}`);
+    throw new Error(`found World of Warcraft at ${wowOnly[0]}, but not WoW: Forever. Install Forever from Battle.net (it's a separate game version), launch it once, then ${RERUN}.${where}`);
   }
   if (prefixes.length) {
-    throw new Error(`found Battle.net (${prefixes[0]}) but no World of Warcraft. Install WoW: Forever from Battle.net, launch it once, then run ./install.sh again.${where}`);
+    throw new Error(`found Battle.net (${prefixes[0]}) but no World of Warcraft. Install WoW: Forever from Battle.net, launch it once, then ${RERUN}.${where}`);
   }
-  throw new Error(`couldn't find Battle.net. On Omarchy, install it with omarchy-install-gaming-battlenet, install WoW: Forever from it and launch it once, then run ./install.sh again.${where}`);
+  if (MAC || WIN) throw new Error(`couldn't find World of Warcraft. Install Battle.net from blizzard.com, install WoW: Forever from it and launch it once, then ${RERUN}.${where}`);
+  throw new Error(`couldn't find Battle.net. On Omarchy, install it with omarchy-install-gaming-battlenet; on CachyOS, add Battle.net to Faugus Launcher or Lutris. Then install WoW: Forever from it, launch it once, and ${RERUN}.${where}`);
 }
 
-// Quiet unless it fails (enabling prints "Created symlink …", which isn't news).
-function systemctl(...args) {
-  const r = spawnSync('systemctl', ['--user', ...args], { encoding: 'utf8' });
-  if (r.status !== 0) process.stderr.write(r.stderr || `systemctl --user ${args.join(' ')} failed\n`);
+// The bridge runs as a systemd user service on Linux and a launchd agent on macOS.
+// Commands are quiet unless they fail (enabling prints "Created symlink …", which isn't news).
+function quiet(cmd, args, { warn = true } = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8' });
+  if (r.status !== 0 && warn) process.stderr.write(r.stderr || `${cmd} ${args.join(' ')} failed\n`);
   return r.status === 0;
 }
+
+// On macOS, the launch agent runs the `node` found on PATH, such as Homebrew's
+// /opt/homebrew/bin/node, rather than the versioned folder that link points to.
+// `brew upgrade node` deletes the old versioned folder, and the agent would then fail
+// to start at the next login.
+function bridgeCommand() {
+  const linked = (process.env.PATH || '').split(path.delimiter).map((dir) => path.join(dir, 'node')).find((p) => {
+    try {
+      return fs.realpathSync(p) === process.execPath;
+    } catch {
+      return false;
+    }
+  });
+  return [(MAC && linked) || process.execPath, path.join(BRIDGE_ROOT, 'bin', 't3code-wow.js'), 'run'];
+}
+
+const systemd = {
+  name: 't3code-wow.service',
+  file: path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'systemd/user', 't3code-wow.service'),
+  kind: 'user service',
+  install() {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    fs.writeFileSync(this.file, [
+      '[Unit]',
+      'Description=T3 Code bridge for World of Warcraft',
+      'After=graphical-session.target',
+      '',
+      '[Service]',
+      `ExecStart=${bridgeCommand().join(' ')}`,
+      'Restart=always',
+      'RestartSec=3',
+      `Environment=PATH=${process.env.PATH}`,
+      '',
+      '[Install]',
+      'WantedBy=default.target',
+      '',
+    ].join('\n'));
+    quiet('systemctl', ['--user', 'daemon-reload']);
+    quiet('systemctl', ['--user', 'enable', this.name]);
+    return quiet('systemctl', ['--user', 'restart', this.name]);
+  },
+  restart() {
+    quiet('systemctl', ['--user', 'restart', this.name]);
+  },
+  remove() {
+    quiet('systemctl', ['--user', 'disable', '--now', this.name], { warn: false });
+    fs.rmSync(this.file, { force: true });
+    quiet('systemctl', ['--user', 'daemon-reload'], { warn: false });
+  },
+};
+
+const launchd = {
+  name: 't3code-wow',
+  file: path.join(os.homedir(), 'Library/LaunchAgents/t3code-wow.plist'),
+  kind: 'launch agent',
+  target: () => `gui/${process.getuid()}`,
+  install() {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    const str = (v) => `<string>${String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</string>`;
+    fs.writeFileSync(this.file, [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0">',
+      '<dict>',
+      `  <key>Label</key>${str(this.name)}`,
+      `  <key>ProgramArguments</key><array>${bridgeCommand().map(str).join('')}</array>`,
+      `  <key>EnvironmentVariables</key><dict><key>PATH</key>${str(process.env.PATH)}</dict>`,
+      '  <key>RunAtLoad</key><true/>',
+      '  <key>KeepAlive</key><true/>',
+      '  <key>ThrottleInterval</key><integer>3</integer>',
+      '  <key>ProcessType</key><string>Interactive</string>',
+      `  <key>StandardOutPath</key>${str(path.join(STATE_DIR, 'bridge.log'))}`,
+      `  <key>StandardErrorPath</key>${str(path.join(STATE_DIR, 'bridge.log'))}`,
+      '</dict>',
+      '</plist>',
+      '',
+    ].join('\n'));
+    // Reload so a changed plist (a new node path, say) takes effect.
+    quiet('launchctl', ['bootout', `${this.target()}/${this.name}`], { warn: false });
+    if (quiet('launchctl', ['bootstrap', this.target(), this.file], { warn: false })) return true;
+    // bootout can still be finishing ("Bootstrap failed: 5"); only the retry's error is worth showing.
+    spawnSync('sleep', ['1']);
+    return quiet('launchctl', ['bootstrap', this.target(), this.file]);
+  },
+  restart() {
+    quiet('launchctl', ['kickstart', '-k', `${this.target()}/${this.name}`]);
+  },
+  remove() {
+    quiet('launchctl', ['bootout', `${this.target()}/${this.name}`], { warn: false });
+    fs.rmSync(this.file, { force: true });
+  },
+};
+
+const RUNNING_FILE = path.join(STATE_DIR, 'running.json');
+
+const SERVICES = {
+  darwin: () => launchd,
+  win32: () => logonTask({ file: path.join(CONFIG_DIR, 't3code-wow.task.xml'), command: [...bridgeCommand().slice(0, 2), 'supervise'], runningFile: RUNNING_FILE }),
+};
+const service = (SERVICES[process.platform] || (() => systemd))();
 
 // Copy just the addon code (leaving Signals/ and generated media alone).
 function syncAddon(addonsDir) {
@@ -152,34 +258,19 @@ async function cmdInstall(args) {
   console.log(`${C.g('✓')} T3 Code session ready ${C.d('(scoped to reading and running threads; revoke with `t3 auth session list`)')}`);
 
   if (!args['no-service']) {
-    const node = process.execPath;
-    const script = path.join(BRIDGE_ROOT, 'bin', 't3code-wow.js');
-    fs.mkdirSync(path.dirname(UNIT_FILE), { recursive: true });
-    fs.writeFileSync(UNIT_FILE, [
-      '[Unit]',
-      'Description=T3 Code bridge for World of Warcraft',
-      'After=graphical-session.target',
-      '',
-      '[Service]',
-      `ExecStart=${node} ${script} run`,
-      'Restart=always',
-      'RestartSec=3',
-      `Environment=PATH=${process.env.PATH}`,
-      '',
-      '[Install]',
-      'WantedBy=default.target',
-      '',
-    ].join('\n'));
-    systemctl('daemon-reload');
-    systemctl('enable', UNIT_NAME);
-    systemctl('restart', UNIT_NAME);
-    console.log(`${C.g('✓')} Bridge running as the ${UNIT_NAME} user service`);
+    if (!service.install()) {
+      console.log(C.r(`✗ The bridge's ${service.kind} didn't start (the error is above). Fix that, then run \`t3code-wow install\` again.`));
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${C.g('✓')} Bridge running as the ${service.name} ${service.kind}`);
+    if (MAC) console.log(`${C.y('!')} The bridge reads the game's pixels, so macOS asks for Screen Recording permission the first time.`);
   }
 
   console.log('');
   await firstLaunch({
     restart: freshAddon || had < slots || bellsMissing,
-    running: !!findWowProcess(),
+    running: !!(await findWowProcess()),
     waiting: !args['no-service'] && process.stdin.isTTY && process.stdout.isTTY,
     since: Date.now(),
   });
@@ -217,8 +308,12 @@ async function firstLaunch({ restart, running, waiting, since }) {
         connected = st;
         break;
       }
-      const msg = st?.wow ? 'World of Warcraft is running. Waiting for you to log in… (Enter to skip)' : 'Waiting for World of Warcraft to start… (Enter to skip)';
+      const blocked = st?.capture?.state === 'error' && st.capture.lastError === SCREEN_PERMISSION_HELP;
+      const msg = blocked
+        ? 'Waiting for Screen Recording permission (see above)… (Enter to skip)'
+        : st?.wow ? 'World of Warcraft is running. Waiting for you to log in… (Enter to skip)' : 'Waiting for World of Warcraft to start… (Enter to skip)';
       if (msg !== shown) {
+        if (blocked) process.stdout.write(`\r\x1b[2K${C.y(SCREEN_PERMISSION_HELP)}\n`);
         process.stdout.write(`\r\x1b[2K${C.d(msg)}`);
         shown = msg;
       }
@@ -267,7 +362,13 @@ async function cmdRun(args) {
   };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
+  if (args['stop-with']) stopWhenGone(Number(args['stop-with']), stop);
   await bridge.start();
+}
+
+async function cmdSupervise() {
+  await supervise({ command: bridgeCommand(), logFile: path.join(STATE_DIR, 'bridge.log'), runningFile: RUNNING_FILE, stopWithPid: process.ppid });
+  process.exit(0);
 }
 
 function ago(ms) {
@@ -300,6 +401,7 @@ function cmdStatus(args) {
   }
   console.log(`  Live updates left this session: ${st.slots.remaining}/${st.slots.total} ${C.d(`· ${st.publishes} updates sent · update bell #${st.signals.next}`)}`);
   console.log(`  Speech: ${st.voice.tts || C.y('none')} · Dictation: ${st.voice.dictation || C.y('none')}`);
+  if (st.voice.hint) console.log(`    ${C.d(st.voice.hint)}`);
   if (args.log || args.v) {
     console.log('');
     for (const l of st.log) console.log(C.d(l));
@@ -307,7 +409,7 @@ function cmdStatus(args) {
 }
 
 async function cmdProbe() {
-  const proc = findWowProcess();
+  const proc = await findWowProcess();
   const cap = new StripCapture({});
   console.log(`backend: ${cap.resolveBackend()}; WoW pid: ${proc?.pid ?? 'not running'}`);
   const res = await cap.grab(proc?.pid);
@@ -320,7 +422,7 @@ async function cmdProbe() {
     execFileSync('magick', [out, out.replace(/\.ppm$/, '.png')]);
     png = out.replace(/\.ppm$/, '.png');
   } catch {}
-  const dec = decodeImage(img);
+  const dec = decodeImage(img, null, { searchY: res.searchY });
   console.log(`captured ${img.width}x${img.height} -> ${png}`);
   if (!dec) console.log('no strip visible (open the T3 window in game, or send something)');
   else if (dec.error) console.log(`strip found but unreadable: ${dec.error} (cell ${dec.geo.cell}px at ${dec.geo.ox},${dec.geo.oy})`);
@@ -333,6 +435,19 @@ async function ask(question) {
   const answer = await rl.question(question);
   rl.close();
   return /^y(es)?$/i.test(answer.trim());
+}
+
+// The file is in the console's code page, which Node can't decode, so any letters
+// outside ASCII count as the same.
+function shimIsOurs() {
+  const plain = (text) => text.replace(/[^\x20-\x7e]+/g, '?').toLowerCase();
+  try {
+    const target = /"([^"]+)"/.exec(fs.readFileSync(BIN_SHIM, 'latin1'))?.[1] || '';
+    const script = path.normalize(target.replace(/^%USERPROFILE%/i, () => os.homedir()));
+    return plain(script).startsWith(plain(`${DATA_DIR}${path.sep}`));
+  } catch {
+    return false;
+  }
 }
 
 // Remove everything install put on this computer, and revoke the bridge's sessions.
@@ -349,10 +464,8 @@ async function cmdUninstall(args) {
   const done = (msg) => console.log(`${C.g('✓')} ${msg}`);
   const warn = (msg) => console.log(`${C.y('!')} ${msg}`);
 
-  if (fs.existsSync(UNIT_FILE)) {
-    spawnSync('systemctl', ['--user', 'disable', '--now', UNIT_NAME], { stdio: 'ignore' });
-    fs.rmSync(UNIT_FILE);
-    spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore' });
+  if (fs.existsSync(service.file)) {
+    service.remove();
     done('Stopped and removed the bridge service');
   }
 
@@ -390,8 +503,12 @@ async function cmdUninstall(args) {
   const claims = tokenClaims(readToken() || '');
   const t3 = findT3Cli();
   if (claims?.sid && t3) {
-    const r = spawnSync(t3, ['auth', 'session', 'revoke', claims.sid], { encoding: 'utf8', timeout: 60000 });
-    if (r.status === 0) done('Revoked the bridge\'s T3 Code session');
+    let revoked = false;
+    try {
+      const [file, argv, options] = t3Command(t3, ['auth', 'session', 'revoke', claims.sid]);
+      revoked = spawnSync(file, argv, { encoding: 'utf8', timeout: 60000, ...options }).status === 0;
+    } catch {}
+    if (revoked) done('Revoked the bridge\'s T3 Code session');
     else warn(`Couldn't revoke the bridge's T3 Code session; remove it with \`t3 auth session list\` (${claims.sid}).`);
   }
   for (const e of cfg.environments || []) {
@@ -412,10 +529,11 @@ async function cmdUninstall(args) {
   try {
     if (fs.lstatSync(BIN_LINK).isSymbolicLink() && fs.readlinkSync(BIN_LINK).startsWith(DATA_DIR)) fs.rmSync(BIN_LINK);
   } catch {}
+  if (WIN && shimIsOurs()) fs.rmSync(BIN_SHIM, { force: true });
   fs.rmSync(DATA_DIR, { recursive: true, force: true });
   done('Removed the t3code-wow command and its files');
 
-  if (findWowProcess()) console.log(`\nWorld of Warcraft is running: ${C.b('/reload')} or restart it to finish unloading T3 Code.`);
+  if (await findWowProcess()) console.log(`\nWorld of Warcraft is running: ${C.b('/reload')} or restart it to finish unloading T3 Code.`);
 }
 
 async function cmdEnv(args) {
@@ -478,7 +596,7 @@ async function cmdEnv(args) {
     const entry = { code, id: ident.environmentId, label: ident.label || host, ssh, urls: good };
     cfg.environments = cfg.environments.filter((e) => e.id !== ident.environmentId).concat(entry);
     writeConfig(cfg);
-    if (fs.existsSync(UNIT_FILE)) systemctl('restart', UNIT_NAME);
+    if (fs.existsSync(service.file)) service.restart();
     console.log(`${C.g('✓')} ${ident.label}'s threads will show in game within a few seconds.`);
     return;
   }
@@ -498,7 +616,7 @@ async function cmdEnv(args) {
     fs.rmSync(tokenFile(e.id), { force: true });
     cfg.environments = cfg.environments.filter((x) => x !== e);
     writeConfig(cfg);
-    if (fs.existsSync(UNIT_FILE)) systemctl('restart', UNIT_NAME);
+    if (fs.existsSync(service.file)) service.restart();
     console.log(`${C.g('✓')} Removed ${e.label}`);
     return;
   }
@@ -529,12 +647,15 @@ function help() {
 
 const args = parseArgs(process.argv.slice(2));
 const cmd = args._[0];
-const commands = { env: cmdEnv, install: cmdInstall, run: cmdRun, status: cmdStatus, sync: cmdSync, probe: cmdProbe, uninstall: cmdUninstall };
+const commands = { env: cmdEnv, install: cmdInstall, run: cmdRun, status: cmdStatus, sync: cmdSync, probe: cmdProbe, uninstall: cmdUninstall, supervise: cmdSupervise };
 if (!cmd || args.help || !commands[cmd]) {
   help();
   if (cmd && !commands[cmd]) process.exitCode = 1;
 } else {
   Promise.resolve(commands[cmd](args)).catch((err) => {
+    // Windows won't replace or remove a file another program has open (measured: EBUSY
+    // for a write, EPERM for a removal).
+    if (WIN && ['EBUSY', 'EPERM'].includes(err.code)) err.message = `${err.dest || err.path || 'A file'} can't be changed right now: another program has it open, or this Windows account isn't allowed to write there. If World of Warcraft is running, quit it, then run this again.`;
     console.error(C.r(`✗ ${err.message}`));
     process.exitCode = 1;
   });

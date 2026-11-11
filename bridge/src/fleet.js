@@ -6,7 +6,7 @@
 // copy with `id`/`projectId` rewritten and `_env` pointing at its machine.
 
 import { EventEmitter } from 'node:events';
-import { T3Client } from './t3.js';
+import { T3Client, modelChoices } from './t3.js';
 import { remoteTokenProvider, remoteOriginProvider } from './envs.js';
 
 const SEP = '~';
@@ -139,7 +139,7 @@ export class Fleet extends EventEmitter {
       local: e.local || undefined,
       state: e.client.state,
       error: e.client.error || undefined,
-      threads: e.client.threads.size,
+      threads: [...e.client.threads.values()].filter((t) => !t.lineage?.parentThreadId).length,
     }));
   }
 
@@ -192,6 +192,16 @@ export class Fleet extends EventEmitter {
     return env.client.unsettle(id);
   }
 
+  snooze(key, until) {
+    const { env, id } = this.split(key);
+    return env.client.snooze(id, until);
+  }
+
+  unsnooze(key) {
+    const { env, id } = this.split(key);
+    return env.client.unsnooze(id);
+  }
+
   archive(key) {
     const { env, id } = this.split(key);
     return env.client.archive(id);
@@ -200,5 +210,20 @@ export class Fleet extends EventEmitter {
   visit(key) {
     const { env, id } = this.split(key);
     return env.client.visit(id);
+  }
+
+  setModel(key, instanceId, model, effort) {
+    const { env, id } = this.split(key);
+    return env.client.setModel(id, instanceId, model, effort);
+  }
+
+  defaultModelFor(projectKey) {
+    const { env, id } = this.split(projectKey);
+    return env.client.defaultModelFor(id);
+  }
+
+  // Each machine's models, keyed by its id prefix ('' for this one).
+  modelGroups() {
+    return this.envs.map((env) => ({ code: env.code, choices: modelChoices(env.client.config?.providers) }));
   }
 }

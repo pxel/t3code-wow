@@ -176,13 +176,48 @@ function M:CreateThreadsPage(page)
 	end)
 	header.Archive:SetPoint("RIGHT", header.Action, "LEFT", -4, 0)
 	header.Archive:Hide()
+	-- Snooze: a button that opens the shared list of T3's snooze presets, so it carries
+	-- what the list reads from its owner. On a snoozed thread it wakes it instead.
+	header.Snooze = UI.Button(header, "Snooze", 86, function() M:SnoozeAction() end)
+	header.Snooze:SetPoint("RIGHT", header.Action, "LEFT", -4, 0)
+	header.Snooze:Hide()
+	header.Snooze.options = {}
+	header.Snooze.listWidth = 220
+	header.Snooze.Update = function(self) self.value = nil end
+	header.Snooze.onChange = function(value)
+		if value == "custom" then
+			M:OpenCustomSnooze()
+		elseif ns.viewId and value then
+			M:SendSnooze(ns.viewId, value)
+		end
+	end
+	UI.Tooltip(header.Snooze, function(self) return self:GetText() end, function()
+		local t = ns.Store:Thread(ns.viewId)
+		if t and t.s == "snoozed" then return "Bring this thread back to the Open list now." end
+		return "Hide this thread until a time you pick. The times are the snooze presets from T3 Code's settings."
+	end)
 	UI.Tooltip(header.Archive, "Archive", "Hide this thread from the list (it stays in T3 Code's archive).")
-	header.Project = UI.Dropdown(header, 220, function(value)
+	header.Project = UI.Dropdown(header, 176, function(value)
 		M.newProject = value
+		M.newModel, M.newEffort = nil, nil
 		M:Refresh()
 	end)
 	header.Project:SetPoint("RIGHT", -6, 0)
 	header.Project:Hide()
+	-- The model: for the new thread, or the open thread's next runs. Only a deliberate
+	-- pick from the list changes it (no wheel or right-click stepping), because each
+	-- change on a thread is a command to T3.
+	local function ListOnly(dd)
+		dd:SetScript("OnClick", function(self) UI.OpenList(self) end)
+		dd:EnableMouseWheel(false)
+		dd:SetScript("OnMouseWheel", nil)
+		dd:Hide()
+		return dd
+	end
+	header.Model = ListOnly(UI.Dropdown(header, 176, function(value) M:PickModel(value) end))
+	header.Model.listWidth = 300 -- room for "Model · Provider" rows
+	-- How hard the model reasons, when it has levels to pick from.
+	header.Effort = ListOnly(UI.Dropdown(header, 92, function(value) M:PickEffort(value) end))
 	right.Header = header
 
 	local composer = UI.Inset(right)
@@ -194,7 +229,6 @@ function M:CreateThreadsPage(page)
 	local box = CreateFrame("Frame", nil, composer, "T3CodeComposerTemplate")
 	box:SetPoint("TOPLEFT", 8, -6)
 	box:SetPoint("BOTTOMRIGHT", -8, 18)
-	box:SetDefaultText("Message the agent  (Shift+Enter for a new line)")
 	box:RegisterCallback("OnEnterPressed", function()
 		if IsShiftKeyDown() then
 			box:Insert("\n")
@@ -206,6 +240,7 @@ function M:CreateThreadsPage(page)
 	box:RegisterCallback("OnEscapePressed", function() box:ClearFocus() end, M)
 	right.Composer = box
 	self.composer = box
+	self:SetPlaceholder("Message the agent  (Shift+Enter for a new line)")
 
 	local counter = UI.Text(composer, "GameFontDisableSmall", "RIGHT")
 	counter:SetPoint("BOTTOMRIGHT", -8, 5)
@@ -244,9 +279,10 @@ function M:CreateButtonBar(f)
 	bar.Mic = UI.IconButton(f, "voicechat-icon-mic", 26, "Dictate", function() M:ToggleDictation() end)
 	bar.Mic:SetPoint("LEFT", bar.Stop, "RIGHT", 6, 0)
 	UI.Tooltip(bar.Mic, nil, function()
-		local d = ns.Store.data.bridge and ns.Store.data.bridge.dictation
-		return d and ("Click, speak, click again: your words are typed into the message box (" .. d .. " on your desktop). On a controller, hold Y.")
-			or "No dictation backend found on the desktop. Install one from the Omarchy menu (Install > AI > Dictation)."
+		local b = ns.Store.data.bridge or {}
+		if b.dictationHint then return b.dictationHint end
+		if not b.dictation then return "No dictation backend found on the desktop." end
+		return "Click, speak, click again: your words are typed into the message box (" .. b.dictation .. " on your desktop). On a controller, hold Y."
 	end)
 
 	bar.Speak = UI.IconButton(f, "voicechat-icon-speaker", 26, "Read aloud", function()
@@ -365,6 +401,11 @@ function M:Back()
 		self:ToggleSidebar(true)
 		return
 	end
+	self:CloseThread()
+end
+
+-- Back to no thread selected.
+function M:CloseThread()
 	self:SaveDraft()
 	ns.viewId = nil
 	ns.Transport:Touch()
@@ -373,10 +414,18 @@ function M:Back()
 	ns:Fire("ViewSelected", nil)
 end
 
+-- Snooze a thread and remember the command: once the thread is snoozed it leaves the
+-- screen (see ThreadTransition below), and a refused command leaves it open.
+function M:SendSnooze(threadId, ...)
+	local cmd = ns.Transport:Send("snooze", threadId, ...)
+	if cmd then self.pendingSnooze = { cmd = cmd, thread = threadId, at = GetTime() } end
+end
+
 function M:StartNewThread(projectId)
 	self:Create()
 	self:SaveDraft()
 	self.mode = "new"
+	self.newModel, self.newEffort = nil, nil
 	local filter = ns.db.settings.project
 	self.newProject = projectId or (filter ~= "all" and filter) or ns.db.settings.lastProject
 	if not ns.Store.projectsById[self.newProject or ""] then
@@ -388,6 +437,97 @@ function M:StartNewThread(projectId)
 	self:Open()
 	self:Refresh()
 	self.composer:SetFocus()
+end
+
+-- T3's snooze presets as the bridge resolved them: { k = id, l = label, w = time }.
+function M:SnoozeOptions()
+	local options = {}
+	local bridge = ns.Store.data.bridge
+	for _, c in ipairs(type(bridge.snz) == "table" and bridge.snz or {}) do
+		table.insert(options, { value = c.k, label = c.w and (c.l .. "  " .. ns.Color("grey", c.w)) or c.l, text = c.l })
+	end
+	-- A bridge that sends presets also reads a typed time.
+	if type(bridge.snz) == "table" then table.insert(options, { value = "custom", label = "Custom…" }) end
+	return options
+end
+
+-- A small box under the Snooze button for typing a time. The bridge reads it, on the
+-- desktop's clock, so the text goes over as typed.
+function M:OpenCustomSnooze()
+	local t = ns.Store:Thread(ns.viewId)
+	if not t then return end
+	local p = self.snoozePanel
+	if not p then
+		local header = self.frame.Pages.threads.Right.Header
+		p = CreateFrame("Frame", "T3CodeSnoozePanel", self.frame)
+		p:SetFrameStrata("FULLSCREEN_DIALOG")
+		p:SetToplevel(true)
+		p:SetSize(272, 112)
+		p:SetPoint("TOPRIGHT", header.Snooze, "BOTTOMRIGHT", 0, -2)
+		p:EnableMouse(true)
+		p:SetClampedToScreen(true)
+		local bg = p:CreateTexture(nil, "BACKGROUND")
+		bg:SetAtlas("common-dropdown-bg")
+		bg:SetPoint("TOPLEFT", -10, 3)
+		bg:SetPoint("BOTTOMRIGHT", 10, -3)
+		bg:SetAlpha(0.95)
+		if not bg:GetAtlas() then bg:SetColorTexture(0.05, 0.05, 0.05, 0.95) end
+		-- Solid behind the text: the transcript underneath would show through the art.
+		local solid = p:CreateTexture(nil, "BACKGROUND", nil, -1)
+		solid:SetAllPoints()
+		solid:SetColorTexture(0.03, 0.03, 0.03, 1)
+		p.Title = UI.Text(p, "GameFontNormal", "LEFT")
+		p.Title:SetPoint("TOPLEFT", 14, -12)
+		p.Title:SetText("Snooze until")
+		p.Box = CreateFrame("EditBox", nil, p, "InputBoxTemplate")
+		p.Box:SetSize(150, 20)
+		p.Box:SetPoint("TOPLEFT", 20, -32)
+		p.Box:SetAutoFocus(false)
+		p.Box:SetMaxLetters(40)
+		p.Box:SetScript("OnEnterPressed", function() M:SubmitCustomSnooze() end)
+		p.Box:SetScript("OnEscapePressed", function() p:Hide() end)
+		p.Go = UI.Button(p, "Snooze", 76, function() M:SubmitCustomSnooze() end)
+		p.Go:SetPoint("LEFT", p.Box, "RIGHT", 6, 0)
+		p.Hint = UI.Text(p, "GameFontDisableSmall", "LEFT")
+		p.Hint:SetPoint("TOPLEFT", 14, -62)
+		p.Hint:SetPoint("RIGHT", -14, 0)
+		p.Hint:SetJustifyV("TOP")
+		p.Hint:SetWordWrap(true)
+		p.Hint:SetText("Try 45m, 3h, 2d, 5pm, tomorrow 9am or fri 3pm.")
+		p:SetScript("OnHide", function() p.Box:ClearFocus() end)
+		p:Hide()
+		tinsert(UISpecialFrames, "T3CodeSnoozePanel")
+		self.snoozePanel = p
+	end
+	p.threadId = t.id
+	p:Show()
+	p.Box:SetFocus()
+	p.Box:HighlightText()
+end
+
+function M:SubmitCustomSnooze()
+	local p = self.snoozePanel
+	if not p or not p.threadId then return end
+	local text = strtrim(p.Box:GetText() or "")
+	if text == "" then return end
+	-- The text stays in the box, so a time the bridge couldn't read is easy to fix.
+	self:SendSnooze(p.threadId, "custom", text)
+	PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+	p:Hide()
+end
+
+function M:SnoozeAction()
+	local t = ns.Store:Thread(ns.viewId)
+	if not t then return end
+	if t.s == "snoozed" then
+		ns.Transport:Send("unsnooze", t.id)
+		PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+		return
+	end
+	local button = self.frame.Pages.threads.Right.Header.Snooze
+	button.options = self:SnoozeOptions()
+	button.value = nil
+	if #button.options > 0 then UI.OpenList(button) end
 end
 
 function M:HeaderAction()
@@ -416,23 +556,35 @@ function M:Send(textOverride)
 	local text = textOverride or self.composer:GetInputText() or ""
 	text = strtrim(text)
 	if text == "" then return end
-	if #text > 2300 then
-		ns.Print("That message is too long to send from the game (max ~2,000 characters).")
-		return
-	end
 	if self.mode == "new" then
 		if not self.newProject then
 			ns.Print("Pick a project for the new thread first.")
 			return
 		end
+		local instanceId, slug = ns.Store.SplitModelKey(self:ChosenNewModel())
+		local effort = self:ChosenNewEffort()
+		local id
+		if effort then
+			-- An empty model means T3 Code's default, at this level.
+			id = ns.Transport:Send("new", self.newProject, text, instanceId or "", slug or "", effort)
+		else
+			id = ns.Transport:Send("new", self.newProject, text, instanceId, slug)
+		end
+		if not id then return end -- too long; the composer keeps it
 		ns.db.settings.lastProject = self.newProject
-		self.pendingNew = ns.Transport:Send("new", self.newProject, text)
+		self.pendingNew = id
 		self.pendingNewText = text
 		ns.db.drafts.__new = nil
 	elseif ns.viewId and not textOverride and ns.Transcript:CustomAnswer(text) then
 		ns.db.drafts[ns.viewId] = nil
 	elseif ns.viewId then
-		ns.Transport:Send("send", ns.viewId, text)
+		local id
+		if ns.db.settings.steerFollowUps then
+			id = ns.Transport:Send("send", ns.viewId, text, "steer")
+		else
+			id = ns.Transport:Send("send", ns.viewId, text)
+		end
+		if not id then return end -- too long; the composer keeps it
 		ns.Transcript:AddLocalEcho(ns.viewId, text)
 		ns.db.drafts[ns.viewId] = nil
 	else
@@ -524,10 +676,20 @@ function M:ToggleDictation()
 		self.dictating = false
 		ns.Transport:Send("dictate", "stop")
 	else
+		local b = ns.Store.data.bridge
+		if b and b.dictationHint then
+			-- Push-to-talk repeats while the key is held; say this once, not every time.
+			local now = GetTime()
+			if not self.dictNoteAt or now - self.dictNoteAt > 5 then
+				self.dictNoteAt = now
+				ns.Print(b.dictationHint)
+			end
+			return
+		end
 		self.dictating = true
 		self:Open()
 		self.composer:SetFocus()
-		ns.Transport:Send("dictate", "start")
+		self.dictCmd = ns.Transport:Send("dictate", "start")
 	end
 	self:Refresh()
 end
@@ -574,27 +736,71 @@ function M:UpdateRefreshButton()
 	f.RefreshSlots:SetShown(low and not InCombatLockdown())
 end
 
+-- Blizzard's edit box keeps a shown placeholder as the box's text, and only swaps
+-- it while the box is empty. Changed in place, the old placeholder stayed behind as
+-- text that focusing no longer cleared, so typing went after it. Set it again on an
+-- empty box so the new one replaces the old.
+function M:SetPlaceholder(text)
+	if self.placeholder == text then return end
+	self.placeholder = text
+	self.composer:SetDefaultText(text)
+	if self.composer:GetInputText() == "" then self.composer:SetText("") end
+end
+
+-- The open thread's header line: status, project, and how long it has been running
+-- or how long ago it finished.
+function M:HeaderText(t)
+	local age = ((t.s == "working" or t.s == "waiting") and t.st) and ns.Duration(time() - t.st) or ns.Ago(t.u)
+	-- A snoozed thread says when it's back, and little else: the Wake button already
+	-- says it's snoozed, and beside the pickers there's only room for the time.
+	if t.s == "snoozed" then
+		return string.format("%s  ·  %s", ns.Color("grey", "Back " .. ns.Until(t.w)), ns.Store:ProjectName(t.p))
+	end
+	return string.format("%s  ·  %s  ·  %s",
+		ns.Color(ns.Store.StatusColor(t.s), ns.Store.StatusText(t.s)), ns.Store:ProjectName(t.p), age)
+end
+
 function M:Refresh()
 	local f = self.frame
 	if not f or not f:IsShown() then return end
 	f.Status:SetText(self:StatusLine())
+	self.bridgeState = ns.Transport:BridgeState()
 	self:UpdateRefreshButton()
 
 	local right = f.Pages.threads.Right
 	local header = right.Header
 	local t = ns.Store:Thread(ns.viewId)
+	-- The typed-time box belongs to the thread it was opened on.
+	local panel = self.snoozePanel
+	if panel and panel:IsShown() and (panel.threadId ~= ns.viewId or self.mode == "new" or not t or t.s == "snoozed") then panel:Hide() end
 	if self.mode == "new" then
 		f.Subtitle:SetText("New Thread")
-		header.Text:SetText(ns.Color("gold", "Start a new thread in"))
+		header.Text:SetText(ns.Color("gold", "New thread in"))
+		header.Action:Hide()
+		header.Archive:Hide()
+		header.Snooze:Hide()
+		header.Project:Show()
+		self:SetupProjectDropdown()
+		local withModel = self:SetupModelDropdown()
+		local withEffort = withModel and self:SetupEffortDropdown()
+		if not withEffort then header.Effort:Hide() end
+		header.Model.tipBody = "The model the new thread starts on. It's remembered for this project."
+		header.Effort.tipBody = "How hard the model reasons on the new thread. It's remembered for this project."
+		header.Effort:ClearAllPoints()
+		header.Effort:SetPoint("RIGHT", -6, 0)
+		header.Model:ClearAllPoints()
+		header.Model:SetPoint("RIGHT", withEffort and header.Effort or header, withEffort and "LEFT" or "RIGHT", withEffort and -4 or -6, 0)
+		header.Project:ClearAllPoints()
+		if withModel then
+			header.Project:SetPoint("RIGHT", header.Model, "LEFT", -6, 0)
+		else
+			header.Project:SetPoint("RIGHT", -6, 0)
+		end
 		header.Text:ClearAllPoints()
 		header.Text:SetPoint("LEFT", 12, 0)
 		header.Text:SetPoint("RIGHT", header.Project, "LEFT", -8, 0)
 		header.Text:SetJustifyH("RIGHT")
-		header.Action:Hide()
-		header.Archive:Hide()
-		header.Project:Show()
-		self:SetupProjectDropdown()
-		self.composer:SetDefaultText("Describe what the agent should do  (Shift+Enter for a new line)")
+		self:SetPlaceholder("Describe what the agent should do  (Shift+Enter for a new line)")
 		right.Hint:SetText(self:ShotHint() or "")
 		f.Bar.Send:SetText("Start")
 	else
@@ -606,29 +812,197 @@ function M:Refresh()
 		f.Bar.Send:SetText("Send")
 		if t then
 			f.Subtitle:SetText(t.title)
-			local status = ns.Color(ns.Store.StatusColor(t.s), ns.Store.StatusText(t.s))
-			local age = (t.s == "working" and t.st) and ns.Duration(time() - t.st) or ns.Ago(t.u)
-			header.Text:SetText(string.format("%s  ·  %s  ·  %s", status, ns.Store:ProjectName(t.p), age))
+			header.Text:SetText(self:HeaderText(t))
 			header.Action:SetShown(true)
 			header.Action:SetText(t.s == "settled" and "Reopen" or "Settle")
 			header.Archive:SetShown(t.s == "settled")
-			header.Text:SetPoint("RIGHT", t.s == "settled" and -200 or -110, 0)
-			self.composer:SetDefaultText(t.s == "working" and "Queue a follow-up  (Shift+Enter for a new line)" or "Message the agent  (Shift+Enter for a new line)")
+			-- Snooze shares Archive's place: a settled thread is archived, any other
+			-- snoozed. Without presets from the bridge there's nothing to offer.
+			local snoozable = t.s ~= "settled" and (t.s == "snoozed" or #self:SnoozeOptions() > 0)
+			header.Snooze:SetShown(snoozable)
+			header.Snooze:SetText(t.s == "snoozed" and "Wake" or "Snooze")
+			local withModel = self:SetupModelDropdown()
+			local withEffort = withModel and self:SetupEffortDropdown()
+			if not withEffort then header.Effort:Hide() end
+			header.Model.tipBody = "The model for this thread. A change applies from the next reply on."
+			header.Effort.tipBody = "How hard the model reasons on this thread. A change applies from the next reply on."
+			local anchor = t.s == "settled" and header.Archive or (snoozable and header.Snooze or header.Action)
+			header.Effort:ClearAllPoints()
+			header.Effort:SetPoint("RIGHT", anchor, "LEFT", -4, 0)
+			header.Model:ClearAllPoints()
+			header.Model:SetPoint("RIGHT", withEffort and header.Effort or anchor, "LEFT", -4, 0)
+			local pickers = (withModel and header.Model:GetWidth() + 4 or 0) + (withEffort and header.Effort:GetWidth() + 4 or 0)
+			header.Text:SetPoint("RIGHT", ((t.s == "settled" or snoozable) and -200 or -110) - pickers, 0)
+			local busy = ns.db.settings.steerFollowUps and "Steer the agent" or "Queue a follow-up"
+			self:SetPlaceholder((t.s == "working" and busy or "Message the agent") .. "  (Shift+Enter for a new line)")
 		else
 			f.Subtitle:SetText(ns.Color("grey", "No thread selected"))
 			header.Text:SetText(ns.Color("grey", "Pick a thread on the left, or start a new one"))
 			header.Action:Hide()
 			header.Archive:Hide()
+			header.Snooze:Hide()
+			header.Model:Hide()
+			header.Effort:Hide()
 		end
 		right.Hint:SetText(self:ShotHint() or (ns.Gamepad and ns.Gamepad:IsActive() and ns.Gamepad:HintText()) or "")
 	end
 	f.Bar.Stop:SetEnabled(t ~= nil and t.s == "working" and self.mode ~= "new")
 	f.Bar.Stop.Icon:SetDesaturated(not f.Bar.Stop:IsEnabled())
+	local bridge = ns.Store.data.bridge
+	local canDictate = self.dictating or not (bridge and bridge.dictationHint)
+	f.Bar.Mic:SetEnabled(canDictate)
+	f.Bar.Mic.Icon:SetDesaturated(not canDictate)
 	f.Bar.Mic.Icon:SetVertexColor(self.dictating and 1 or 1, self.dictating and 0.3 or 1, self.dictating and 0.3 or 1)
 	f.Bar.Back:SetEnabled(self.mode == "new" or ns.viewId ~= nil or not f.Pages.threads.Left:IsShown())
 	self:UpdateCounter()
 	ns.ThreadList:Refresh()
 	ns.Transcript:Refresh()
+end
+
+---------------------------------------------------------------------------
+-- Model picker
+
+-- The model the player picked for the new thread, now or last time in this project.
+-- Nil means T3 Code picks when the thread starts.
+function M:ChosenNewModel()
+	if self.newModel then return self.newModel end
+	local saved = self.newProject and ns.db.models[self.newProject]
+	if ns.Store:Offers(ns.Store.EnvOf(self.newProject), saved) then return saved end
+end
+
+-- What the picker shows: the chosen model, else T3 Code's default for the project.
+function M:NewThreadModel()
+	local chosen = self:ChosenNewModel()
+	if chosen then return chosen end
+	local env = ns.Store.EnvOf(self.newProject)
+	local p = ns.Store.projectsById[self.newProject or ""]
+	if p and p.dm then return p.dm end
+	for _, o in ipairs(ns.Store:ModelOptions(env) or {}) do
+		if not o.header then return o.value end
+	end
+end
+
+-- The open thread's model, or the one just picked for it until T3 confirms it.
+function M:ThreadModel(t)
+	local current = ns.Store.ModelKey(t.mi, t.m)
+	local pending = self.pendingModel
+	if pending and pending.thread == t.id then
+		if pending.value == current or GetTime() - pending.at > 30 then
+			self.pendingModel = nil
+		else
+			return pending.value
+		end
+	end
+	return current
+end
+
+-- Fill the model dropdown for what's on screen. Returns whether it's shown.
+function M:SetupModelDropdown()
+	local dd = self.frame.Pages.threads.Right.Header.Model
+	local env, current
+	if self.mode == "new" then
+		env, current = ns.Store.EnvOf(self.newProject), self:NewThreadModel()
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if t then env, current = ns.Store.EnvOf(t.id), self:ThreadModel(t) end
+	end
+	local options = env and ns.Store:ModelOptions(env, current)
+	if not options or (self.mode ~= "new" and not current) then
+		dd:Hide()
+		return false
+	end
+	dd.value = current
+	dd:SetOptions(options)
+	-- Wide enough for "Model · Provider" where it fits, so the provider isn't cut off.
+	local textW = dd.Text:GetUnboundedStringWidth() or 0
+	dd:SetWidth(math.min(self.mode == "new" and 200 or 220, math.max(150, math.ceil(textW) + 40)))
+	dd:Show()
+	return true
+end
+
+-- The reasoning level picked for the new thread, now or last time in this project,
+-- when the model it starts on offers it. Nil means the model's own.
+function M:ChosenNewEffort()
+	local options = ns.Store:EffortOptions(ns.Store.EnvOf(self.newProject), self:NewThreadModel())
+	if ns.Store.HasOption(options, self.newEffort) then return self.newEffort end
+	local saved = self.newProject and ns.db.efforts[self.newProject]
+	if ns.Store.HasOption(options, saved) then return saved end
+end
+
+-- The open thread's reasoning level, or the one just picked for it until T3 confirms it.
+function M:ThreadEffort(t)
+	local pending = self.pendingEffort
+	if pending and pending.thread == t.id then
+		if pending.value == t.re or GetTime() - pending.at > 30 then
+			self.pendingEffort = nil
+		else
+			return pending.value
+		end
+	end
+	return t.re
+end
+
+-- Fill the reasoning dropdown for the model on screen. Returns whether it's shown.
+function M:SetupEffortDropdown()
+	local dd = self.frame.Pages.threads.Right.Header.Effort
+	local env, model, current
+	if self.mode == "new" then
+		env, model = ns.Store.EnvOf(self.newProject), self:NewThreadModel()
+		current = self:ChosenNewEffort()
+		local p = ns.Store.projectsById[self.newProject or ""]
+		if not current then
+			-- What the bridge would carry over: T3's own pick when it's this model,
+			-- else the level last used with the model.
+			if p and p.dm == model then current = p.de else current = ns.Store:LastEffort(env, model) end
+		end
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if t then
+			env, model, current = ns.Store.EnvOf(t.id), self:ThreadModel(t), self:ThreadEffort(t)
+			-- Just switched to another model: it brings the level last used with it.
+			if model ~= ns.Store.ModelKey(t.mi, t.m) and not (self.pendingEffort and self.pendingEffort.thread == t.id) then
+				current = ns.Store:LastEffort(env, model)
+			end
+		end
+	end
+	local options, default = ns.Store:EffortOptions(env, model)
+	if not options then
+		dd:Hide()
+		return false
+	end
+	-- A level the model doesn't have (after a model switch, say) shows as its default.
+	dd.value = ns.Store.HasOption(options, current) and current or default
+	dd:SetOptions(options)
+	dd:Show()
+	return true
+end
+
+function M:PickEffort(value)
+	if self.mode == "new" then
+		self.newEffort = value
+		if self.newProject then ns.db.efforts[self.newProject] = value end
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if not t or value == self:ThreadEffort(t) then return end
+		local instanceId, slug = ns.Store.SplitModelKey(self:ThreadModel(t))
+		if not instanceId then return end
+		self.pendingEffort = { thread = t.id, value = value, at = GetTime(), cmd = ns.Transport:Send("model", t.id, instanceId, slug, value) }
+	end
+	self:Refresh()
+end
+
+function M:PickModel(value)
+	if self.mode == "new" then
+		self.newModel = value
+		if self.newProject then ns.db.models[self.newProject] = value end
+	else
+		local t = ns.Store:Thread(ns.viewId)
+		if not t or value == self:ThreadModel(t) then return end
+		local instanceId, slug = ns.Store.SplitModelKey(value)
+		if not instanceId then return end
+		self.pendingModel = { thread = t.id, value = value, at = GetTime(), cmd = ns.Transport:Send("model", t.id, instanceId, slug) }
+	end
+	self:Refresh()
 end
 
 function M:SetupProjectDropdown()
@@ -658,6 +1032,9 @@ function M:HandleDictation(d)
 	if d.n <= (ns.db.lastDictN or 0) then return end
 	ns.db.lastDictN = d.n
 	if time() - math.floor(d.n / 1000) > 90 then return end -- left over from before a /reload
+	-- A failed start (no backend, the bridge dropped it) must not leave the mic stuck
+	-- "on", or the next press sends stop instead of start.
+	if d.state ~= "listening" and d.state ~= "transcribing" then self.dictating = false end
 	self.dictState = d.state
 	if d.state == "done" and d.text and d.text ~= "" then
 		self:Create()
@@ -702,10 +1079,36 @@ ns:On("LinkChanged", function()
 		M:UpdateRefreshButton()
 	end
 end)
+-- A thread the player just snoozed is out of the way now: clear it off the screen so
+-- the next one can be picked. Opening a snoozed thread from the list still shows it.
+ns:On("ThreadTransition", function(t, _, after)
+	local pending = M.pendingSnooze
+	if after ~= "snoozed" or not pending or pending.thread ~= t.id then return end
+	M.pendingSnooze = nil
+	-- Only right after the pick: a busy thread that turns snoozed minutes later, when
+	-- its run ends, shouldn't vanish from under the player.
+	if GetTime() - pending.at > 20 then return end
+	if ns.viewId == t.id and M.mode == "thread" and M.frame then M:CloseThread() end
+end)
+
 ns:On("CommandResult", function(r)
+	if r.ok == false and r.id == M.dictCmd then
+		-- The start was refused before the bridge sent a dictation state; put the
+		-- mic back so the next press starts instead of sending stop.
+		M.dictCmd = nil
+		M.dictating = false
+		if M.frame and M.frame:IsShown() then M:Refresh() end
+	end
+	if r.ok == false and M.pendingSnooze and r.id == M.pendingSnooze.cmd then M.pendingSnooze = nil end
 	if r.ok == false and r.msg then
 		ns.Print(ns.Color("red", r.msg))
 		if UIErrorsFrame then UIErrorsFrame:AddMessage("T3 Code: " .. r.msg, 1, 0.2, 0.2) end
+	end
+	if r.ok == false then
+		local refused
+		if M.pendingModel and r.id == M.pendingModel.cmd then M.pendingModel, refused = nil, true end
+		if M.pendingEffort and r.id == M.pendingEffort.cmd then M.pendingEffort, refused = nil, true end
+		if refused and M.frame and M.frame:IsShown() then M:Refresh() end
 	end
 	if r.id == M.pendingNew then
 		M.pendingNew = nil
@@ -716,10 +1119,39 @@ ns:On("CommandResult", function(r)
 	end
 end)
 
--- Live elapsed timers in the header.
+-- Live elapsed timers in the header and the visible rows. Only the text changes: the
+-- list and the transcript refresh their rows in place, so this is much cheaper than a
+-- full Refresh, which rebuilds both from the snapshot.
+function M:RefreshTimers()
+	local f = self.frame
+	if not f or not f:IsShown() then return end
+	local t = ns.Store:Thread(ns.viewId)
+	if t and self.mode == "thread" then
+		f.Pages.threads.Right.Header.Text:SetText(self:HeaderText(t))
+	end
+	ns.ThreadList:Refresh()
+	ns.Transcript:Refresh()
+end
+
 C_Timer.NewTicker(1, ns.Safe(function()
-	if M.frame and M.frame:IsShown() and M.page == "threads" then
-		local t = ns.Store:Thread(ns.viewId)
-		if t and t.s == "working" and M.mode == "thread" then M:Refresh() end
+	if not (M.frame and M.frame:IsShown()) then return end
+	-- The link can go stale on its own clock, with no update arriving to say so.
+	local state = ns.Transport:BridgeState()
+	if state ~= M.bridgeState then
+		M.bridgeState = state
+		if M.page == "threads" then
+			M:Refresh()
+		else
+			M.frame.Status:SetText(M:StatusLine())
+			M:UpdateRefreshButton()
+		end
+		return
+	end
+	if M.page ~= "threads" then return end
+	for _, t in ipairs(ns.Store.data.threads) do
+		if t.s == "working" or t.s == "waiting" then
+			M:RefreshTimers()
+			return
+		end
 	end
 end))

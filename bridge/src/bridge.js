@@ -15,23 +15,30 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { RS, US } from './codec.js';
 import { StripCapture } from './capture.js';
-import { SlotBank } from './slots.js';
-import { threadStatus, isUnread } from './t3.js';
+import { SlotBank, replaceFile, FileInUse } from './slots.js';
+import { threadStatus, isUnread, effortOf, waitingOn } from './t3.js';
 import { Fleet } from './fleet.js';
 import { tokenProvider } from './auth.js';
+import { snoozeChoices, snoozedUntil, parseCustomSnooze, describeWhen } from './snooze.js';
 import { Voice } from './voice.js';
 import { OmarchyUsage, mergeUsage } from './usage.js';
 import { findWowProcess, processKey } from './wow.js';
 import { markdownToWow, markdownToSpeech, firstLine, escapeWow } from './format.js';
 import { loadOrCreateKey, deriveKeys, open as openSealed, ENCRYPTED_VERSION } from './strip-crypto.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.4.0';
 export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state'), 't3code-wow');
 
 const sec = (iso) => (iso ? Math.floor(Date.parse(iso) / 1000) : undefined);
 
+// A short, stable hash of one part of a snapshot. The addon reports the ones it holds
+// in its hello, and a publish leaves out a part whose hash hasn't changed since.
+const fingerprint = (value) => createHash('sha1').update(JSON.stringify(value)).digest('hex').slice(0, 16);
+
 const ACTIVE = new Set(['working', 'input', 'plan']);
-const ORDER = { input: 0, plan: 1, working: 2, failed: 3, open: 4, settled: 5 };
+const ORDER = { input: 0, plan: 1, working: 2, waiting: 3, failed: 4, open: 5, snoozed: 6, settled: 7 };
+// Busy, from the player's point of view: the agent isn't done with the thread yet.
+const BUSY = new Set(['working', 'waiting']);
 
 export function activityLabel(projection) {
   if (!projection) return null;
@@ -159,6 +166,11 @@ export function proposedPlan(projection) {
   return plan ? plan.markdown : null;
 }
 
+// How the game names a model: instance and slug, joined by a tab (neither contains one).
+export function modelKey(instanceId, model) {
+  return `${instanceId}\t${model}`;
+}
+
 export function parseFrame(payload) {
   const records = payload.toString('utf8').split(RS).map((r) => r.split(US));
   const out = { hello: null, commands: [] };
@@ -175,6 +187,12 @@ export function parseFrame(payload) {
         view: f[8] || '',
         version: f[9] || '',
         slots: Number(f[10]) || 0,
+        models: f[11] || '',
+        // What the addon already holds: the thread list, the project list and the
+        // transcript. A publish leaves those out when they haven't changed since.
+        list: f[12] || '',
+        projects: f[13] || '',
+        viewHash: f[14] || '',
       };
     } else if (f[0] === 'C') {
       out.commands.push({ id: Number(f[1]), verb: f[2], args: f.slice(3) });
@@ -247,11 +265,14 @@ export class Bridge {
   saveState() {
     clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => {
-      fs.mkdirSync(this.stateDir, { recursive: true });
-      const tmp = this.stateFile + '.tmp';
-      fs.writeFileSync(tmp, JSON.stringify(this.persist));
-      fs.renameSync(tmp, this.stateFile);
+      if (!this.saveStateNow()) this.saveState();
     }, 250);
+  }
+
+  saveStateNow() {
+    clearTimeout(this.saveTimer);
+    fs.mkdirSync(this.stateDir, { recursive: true });
+    return replaceFile(this.stateFile, JSON.stringify(this.persist));
   }
 
   // ---------------------------------------------------------------------------
@@ -267,16 +288,25 @@ export class Bridge {
     this.log(`speech: ${v.tts || 'none'}; dictation: ${v.dictation || 'none'}; capture: ${this.capture.resolveBackend()}`);
     this.t3.on('state', (s, e) => {
       this.log(`T3: ${s}${e ? ` (${e})` : ''}`);
+      this.omarchyUsage.refresh(this.usageInstances());
       this.markDirty('important');
     });
     this.t3.on('change', (ev) => this.onT3Change(ev));
-    this.t3.on('config', () => this.markDirty('minor'));
+    this.t3.on('config', () => {
+      // The providers (and so the usage records to read) are only known once this
+      // arrives; the 60 s timer alone would leave the Usage tab empty for a minute.
+      this.omarchyUsage.refresh(this.usageInstances());
+      this.markDirty('minor');
+    });
     this.t3.start();
-    this.checkProcess();
+    await this.checkProcess();
+    if (this.stopped) return; // stopped while the first process check ran
     this.procTimer = setInterval(() => this.checkProcess(), 4000);
     this.statusTimer = setInterval(() => this.writeStatus(), 3000);
     // Pick up new Omarchy usage records (the shell's Agents panel refreshes them).
+    this.omarchyUsage.refresh(this.usageInstances());
     this.usageTimer = setInterval(() => this.omarchyUsage.refresh(this.usageInstances()), 60000);
+    this.capture.prepare();
     this.captureLoop();
   }
 
@@ -286,12 +316,23 @@ export class Bridge {
     clearInterval(this.statusTimer);
     clearInterval(this.usageTimer);
     clearTimeout(this.publishTimer);
+    clearTimeout(this.wakeTimer);
     this.t3.stop();
     this.voice.hush();
+    this.saveStateNow();
   }
 
   checkProcess() {
-    const proc = findWowProcess();
+    this.checkInFlight ??= findWowProcess()
+      .then((proc) => this.onProcess(proc))
+      .finally(() => {
+        this.checkInFlight = null;
+      });
+    return this.checkInFlight;
+  }
+
+  onProcess(proc) {
+    if (this.stopped) return;
     const key = processKey(proc);
     const was = this.proc;
     this.proc = proc;
@@ -299,7 +340,7 @@ export class Bridge {
       // A new client process: its sound cache is empty, so every signal file is
       // reusable. Reset them and start counting again.
       this.log(`WoW client started (pid ${proc.pid}); resetting live-update signals`);
-      this.bank.resetSignals();
+      if (!this.bank.resetSignals()) return;
       this.persist.processKey = key;
       this.persist.sigCounter = 1;
       this.persist.raised = [];
@@ -331,10 +372,12 @@ export class Bridge {
         } else {
           this.captureState = res.status === 'empty' ? (this.client ? 'idle' : 'waiting') : res.status;
           if (res.status === 'error' && this.capture.stats.captures % 50 === 1) this.log(`capture: ${res.error}`);
-          if (res.status === 'hidden' || res.status === 'no-window') delay = 1000;
+          if (res.status === 'hidden' || res.status === 'no-window') delay = 2000;
           if (Date.now() - this.capture.lastSeenAt < 4000) delay = 150;
           else if (this.client?.flags.includes('o') && res.status === 'empty') delay = 200;
-          else if (this.client && res.status === 'empty') delay = 700; // window closed: nothing urgent
+          // Window closed: nothing urgent, and each poll is a new screencapture
+          // process (plus a window lookup), so take it easy.
+          else if (this.client && res.status === 'empty') delay = 1500;
         }
       }
       await new Promise((r) => setTimeout(r, delay));
@@ -364,7 +407,7 @@ export class Bridge {
     let c = this.client;
     if (!c || c.ui !== hello.ui || c.session !== hello.session) {
       this.log(`addon connected (ui ${hello.ui}, slot ${hello.slot}, signal ${hello.sig}, addon ${hello.version})`);
-      c = this.client = { session: hello.session, ui: hello.ui, ackedSeq: -1, flags: '', view: '' };
+      c = this.client = { session: hello.session, ui: hello.ui, ackedSeq: -1, flags: '', view: '', hashes: {} };
       c.slotNext = hello.slot;
       this.persist.sigCounter = Math.max(this.persist.sigCounter, hello.sig);
       this.markDirty('important');
@@ -398,6 +441,18 @@ export class Bridge {
     c.confirmedAt = Date.now();
     this.persist.confirmedSlot = hello.slot;
     c.version = hello.version;
+    // Which model list the addon holds; it's only sent again when this differs.
+    c.modelsHash = hello.models;
+    // What it holds of the parts a publish may leave out. Only trust a hello that has
+    // applied our latest publish: that's the one point where it can't have moved on
+    // since it spoke. The strip stays on screen and is decoded again on every poll, so
+    // this is also what keeps a pre-publish hello from re-arming what `publishNow`
+    // cleared.
+    // An unencrypted hello is only a bare hello: nothing in it is trusted.
+    if (!sealed) c.hashes = {};
+    else if (hello.gen >= this.lastGen) {
+      c.hashes = { list: hello.list, projects: hello.projects, view: hello.viewHash };
+    }
     c.lastSeen = Date.now();
     this.persist.slotGuess = c.slotNext;
 
@@ -447,12 +502,23 @@ export class Bridge {
           ok = null;
           break;
         case 'new': {
+          // new <project> <text> [<instanceId> <model> [<effort>]]; the model is
+          // empty when only the reasoning level was picked.
           const attachments = await this.takeShots('new', a0);
-          const res = await this.t3.launchThread(a0, a1, attachments);
+          const [, , instanceId, model, effort] = cmd.args;
+          const opts = {};
+          if (instanceId && model) opts.model = { instanceId, model };
+          if (effort) opts.effort = effort;
+          const res = await this.t3.launchThread(a0, a1, attachments, opts);
           msg = 'Thread started';
           if (res?.threadId) this.results.push({ id: cmd.id, ok: true, open: res.threadId });
           break;
         }
+        case 'model':
+          // model <thread> <instanceId> <model> [<effort>]
+          await this.t3.setModel(a0, a1, a2, cmd.args[3] || undefined);
+          msg = 'Model changed';
+          break;
         case 'stop':
           await this.t3.interrupt(a0);
           msg = 'Stopped';
@@ -462,6 +528,26 @@ export class Bridge {
           break;
         case 'unsettle':
           await this.t3.unsettle(a0);
+          break;
+        case 'snooze': {
+          // a1 names one of T3's snooze presets; the time is worked out here, on the
+          // desktop's clock, at the moment the player picked it.
+          if (a1 === 'custom') {
+            // A time the player typed, read on the desktop's clock.
+            const until = parseCustomSnooze(a2);
+            if (!until) throw new Error("Couldn't read that as a time ahead. Try 45m, 3h, 5pm or tomorrow 9am.");
+            await this.t3.snooze(a0, until);
+            msg = `Snoozed until ${describeWhen(until)}`;
+            break;
+          }
+          const choice = snoozeChoices(this.snoozePresets()).find((c) => c.id === a1);
+          if (!choice) throw new Error('That snooze time has passed. Pick another.');
+          await this.t3.snooze(a0, choice.until);
+          msg = `Snoozed: ${choice.label.toLowerCase()}`;
+          break;
+        }
+        case 'unsnooze':
+          await this.t3.unsnooze(a0);
           break;
         case 'archive':
           await this.t3.archive(a0);
@@ -531,7 +617,7 @@ export class Bridge {
     const v = this.voice;
     const viaOmarchy = v.canOmarchyDictate();
     if (!viaOmarchy && !v.canTranscribe()) {
-      throw new Error('no dictation backend; pick one in Omarchy > Setup > Defaults > Dictation');
+      throw new Error(v.dictationHint());
     }
     if (action === 'start') {
       if (viaOmarchy) v.startOmarchy();
@@ -648,7 +734,10 @@ export class Bridge {
       else if (ACTIVE.has(status)) this.refreshView(t.id);
       if (before !== status) {
         this.markDirty('important');
-        if (before === 'working' && status !== 'working') this.announce(t, status);
+        if (t.lineage?.parentThreadId) return; // no announcements for subagent threads
+        // A snoozed thread stays quiet: the player asked not to hear about it yet.
+        if (status === 'snoozed') return;
+        if (BUSY.has(before) && !BUSY.has(status)) this.announce(t, status);
         else if (status === 'input' && before !== 'input') this.announce(t, status);
       } else {
         this.markDirty('minor');
@@ -694,13 +783,35 @@ export class Bridge {
   // ---------------------------------------------------------------------------
   // Snapshot
 
+  snoozePresets() {
+    return this.t3.config?.settings?.snoozePresets;
+  }
+
+  // A snooze ends by the clock, with or without an event from T3, so wake up then
+  // and publish the thread back into the Open list.
+  scheduleWake() {
+    clearTimeout(this.wakeTimer);
+    if (this.stopped) return;
+    const now = Date.now();
+    let next = 0;
+    for (const t of this.t3.threads.values()) {
+      const until = snoozedUntil(t, now);
+      if (until && (!next || until < next)) next = until;
+    }
+    if (!next) return;
+    this.wakeTimer = setTimeout(() => this.markDirty('important'), Math.min(next - now + 1000, 0x7fffffff));
+    this.wakeTimer.unref?.();
+  }
+
   buildSnapshot() {
     const t3 = this.t3;
+    this.scheduleWake();
     const projects = [];
     const usedProjects = new Set();
     let threads = [...t3.threads.values()]
       .map((t) => ({ t, s: threadStatus(t) }))
-      .filter(({ s }) => s !== 'archived');
+      // Subagent threads only while they're busy, like T3's own sidebar.
+      .filter(({ t, s }) => s !== 'archived' && (!t.lineage?.parentThreadId || ACTIVE.has(s)));
     threads.sort((a, b) => ORDER[a.s] - ORDER[b.s] || Date.parse(b.t.updatedAt) - Date.parse(a.t.updatedAt));
     let settled = 0;
     threads = threads.filter(({ s }) => s !== 'settled' || ++settled <= 30).slice(0, 90);
@@ -711,8 +822,10 @@ export class Bridge {
       let label;
       if (s === 'working') label = activityLabel(proj) || (t.status === 'queued' ? 'Queued' : 'Working');
       else if (s === 'input') label = t.pendingRuntimeRequest?.kind === 'user_input' ? 'Needs your answer' : 'Needs your approval';
+      else if (s === 'waiting') label = waitingOn(t);
       else if (s === 'plan') label = 'Plan ready';
       else if (s === 'failed') label = t.lastError ? `Failed: ${String(t.lastError).slice(0, 60)}` : 'Failed';
+      else if (s === 'snoozed') label = 'Snoozed';
       else if (s === 'settled') label = 'Settled';
       else label = t.status === 'interrupted' ? 'Stopped' : 'Finished';
       const last = proj ? lastAssistantText(proj) : t.latestVisibleMessage?.role === 'assistant' ? t.latestVisibleMessage.text : null;
@@ -725,23 +838,32 @@ export class Bridge {
         // A working thread's update time changes with every tool call but isn't shown
         // (the game shows elapsed time), so leave it out to avoid pointless publishes.
         u: s === 'working' ? undefined : sec(t.updatedAt),
-        st: sec(t.activityRunStartedAt || t.latestRunStartedAt),
-        un: s !== 'settled' && isUnread(t) ? true : undefined,
+        // Waiting counts from when the last run ended, as in T3's sidebar.
+        st: s === 'waiting' ? sec(t.latestRunCompletedAt) : sec(t.activityRunStartedAt || t.latestRunStartedAt),
+        un: s !== 'settled' && s !== 'snoozed' && isUnread(t) ? true : undefined,
+        // When a snoozed thread comes back.
+        w: s === 'snoozed' ? sec(t.snoozedUntil) : undefined,
         br: t.branch ? escapeWow(t.branch) : undefined,
         m: t.modelSelection?.model,
+        mi: t.modelSelection?.instanceId,
+        re: effortOf(t.modelSelection),
         env: t._env && !t._env.local ? escapeWow(t._env.label) : undefined,
-        last: last && ACTIVE.has(s) === false && s !== 'settled' ? escapeWow(firstLine(last, 160)) : undefined,
+        last: last && ACTIVE.has(s) === false && s !== 'settled' && s !== 'snoozed' ? escapeWow(firstLine(last, 160)) : undefined,
       };
     });
     for (const p of t3.projects.values()) {
       if (p.archivedAt) continue;
       const remote = p._env && !p._env.local ? p._env.label : null;
       const name = p.title || p.repositoryIdentity?.displayName || 'Project';
+      const dm = t3.defaultModelFor(p.id);
       projects.push({
         id: p.id,
         name: escapeWow(remote ? `${name} · ${remote}` : name),
         env: remote ? escapeWow(remote) : undefined,
         act: usedProjects.has(p.id) || undefined,
+        // The model a new thread here gets unless the player picks one.
+        dm: dm?.instanceId && dm.model ? modelKey(dm.instanceId, dm.model) : undefined,
+        de: effortOf(dm),
       });
     }
     projects.sort((a, b) => (b.act ? 1 : 0) - (a.act ? 1 : 0) || a.name.localeCompare(b.name));
@@ -763,6 +885,9 @@ export class Bridge {
           if (budget < 0 && out.length > 0) break;
           out.unshift({ r: m.role === 'user' ? 'u' : 'a', t: text, at: sec(m.createdAt), live: m.streaming || undefined, n: i + 1 });
         }
+        // Each of these walks the whole turn, so ask once.
+        const plan = t && threadStatus(t) === 'plan' ? proposedPlan(p) : null;
+        const sum = runSummary(p);
         view = {
           id: viewId,
           msgs: out,
@@ -770,8 +895,8 @@ export class Bridge {
           pending: pendingRequest(p) || undefined,
           act: t && threadStatus(t) === 'working' ? escapeWow(activityLabel(p) || 'Working') : undefined,
           err: t?.lastError ? escapeWow(String(t.lastError).slice(0, 300)) : undefined,
-          plan: t && threadStatus(t) === 'plan' && proposedPlan(p) ? markdownToWow(proposedPlan(p), { maxChars: 6000 }) : undefined,
-          sum: runSummary(p) ? escapeWow(runSummary(p)) : undefined,
+          plan: plan ? markdownToWow(plan, { maxChars: 6000 }) : undefined,
+          sum: sum ? escapeWow(sum) : undefined,
           queued: (p.runs || []).filter((r) => r.status === 'queued').length || undefined,
           shots: this.shots.get(viewId)?.length || undefined,
         };
@@ -780,8 +905,10 @@ export class Bridge {
       }
     }
 
+    const voice = this.voice.describe();
+    const models = this.modelsSection();
+
     const usage = [];
-    this.omarchyUsage.refresh(this.usageInstances());
     const enabled = (t3.config?.providers || []).filter((p) => p.enabled && (p.usageLimits || this.omarchyUsage.forInstance(p.instanceId)));
     for (const p of enabled) {
       usage.push(mergeUsage(p, this.omarchyUsage.forInstance(p.instanceId), { escape: escapeWow, sec }));
@@ -794,9 +921,12 @@ export class Bridge {
         t3err: t3.error ? escapeWow(t3.error) : undefined,
         server: t3.config?.environment?.serverVersion,
         host: t3.config?.environment?.label,
-        tts: this.voice.describe().tts || undefined,
-        dictation: this.voice.describe().dictation || undefined,
+        tts: voice.tts || undefined,
+        dictation: voice.dictation || undefined,
+        dictationHint: voice.hint || undefined,
         slots: this.bank.slots,
+        // T3's snooze presets as the choices to offer right now.
+        snz: snoozeChoices(this.snoozePresets()).map((c) => ({ k: c.id, l: escapeWow(c.label), w: c.when ? escapeWow(c.when) : undefined })),
         envs: t3.envs.length > 1 ? t3.environments().map((e) => ({ label: escapeWow(e.label), state: e.state, local: e.local, n: e.threads })) : undefined,
       },
       projects,
@@ -806,8 +936,47 @@ export class Bridge {
       usage,
       dict: this.dictation,
       newShots: this.shots.get('new')?.length || undefined,
+      // ~100 models is several KB, so only when the addon doesn't hold this list yet.
+      models: models && this.client?.modelsHash !== models.h ? models : undefined,
       results: this.results.slice(-8).map(({ id, ok, msg, open }) => ({ id, ok, msg, open })),
+      // Short hashes of the parts a publish may leave out, and of the list the window
+      // redraws from. The addon reports them in its hello. The list also covers the
+      // machines the project filter offers, which the thread list itself doesn't.
+      x: {
+        l: fingerprint({ t: list, p: projects, o: t3.olderSettled || 0, e: t3.environments().map((e) => e.label) }),
+        p: fingerprint(projects),
+        v: view ? fingerprint(view) : '',
+      },
     };
+  }
+
+  // Every machine's model list for the game's model picker, with a short hash the
+  // addon reports back in its hello. Per machine (`e`): its providers (`p`), each
+  // with its models, and the distinct sets of reasoning levels (`x`) those models
+  // point at by 1-based index (`r`), since most models of a provider share one.
+  modelsSection() {
+    const groups = this.t3
+      .modelGroups()
+      .filter((g) => g.choices.length)
+      .map((g) => {
+        const x = [];
+        const sets = new Map();
+        const providers = new Map();
+        for (const c of g.choices) {
+          let r;
+          if (c.effort) {
+            const set = { k: c.effort.id, d: c.effort.default, o: c.effort.options.map((o) => ({ i: o.id, l: escapeWow(o.label) })) };
+            const key = JSON.stringify(set);
+            if (!sets.has(key)) sets.set(key, x.push(set));
+            r = sets.get(key);
+          }
+          if (!providers.has(c.instanceId)) providers.set(c.instanceId, { i: c.instanceId, n: escapeWow(c.provider.replace(/\s+/g, ' ').trim()), m: [] });
+          providers.get(c.instanceId).m.push({ s: c.model, l: escapeWow(c.name), r });
+        }
+        return { e: g.code, x, p: [...providers.values()] };
+      });
+    // An empty list still gets a hash, so the addon drops models that are gone.
+    return { h: createHash('sha1').update(JSON.stringify(groups)).digest('hex').slice(0, 8), g: groups };
   }
 
   // ---------------------------------------------------------------------------
@@ -841,7 +1010,14 @@ export class Bridge {
   //  * new reply text goes fast only while the player is actually reading (flag "a");
   //  * activity-label churn and keep-alives are slow, slower still as slots run low;
   //  * the last RESERVE slots are kept for acks and alerts only.
+  // After a failed write, nothing goes before the retry time, acks included.
   nextPublishDelay() {
+    const delay = this.pacedDelay();
+    if (delay === null || !this.failures) return delay;
+    return Math.max(delay, this.failures.retryAt - Date.now());
+  }
+
+  pacedDelay() {
     const RESERVE = 20;
     const BATCH = 300; // let a burst of changes land in one update
     const c = this.client;
@@ -878,6 +1054,25 @@ export class Bridge {
       // Something may still be dirty (e.g. results) or a heartbeat is due later.
       if (this.client) this.schedulePublish();
     }, delay);
+  }
+
+  // The snapshot minus whatever the addon already holds. `hashes` is what its last
+  // hello reported; the parts whose hash still matches are left out, and `same` names
+  // them so the addon applies the rest on top of them instead of forgetting them. The
+  // thread list always goes: it changes with almost every update and is small.
+  static slimSnapshot(snapshot, hashes = {}) {
+    const same = [];
+    const out = { ...snapshot };
+    if (out.projects && hashes.projects && snapshot.x.p === hashes.projects) {
+      delete out.projects;
+      same.push('p');
+    }
+    if (out.view && hashes.view && snapshot.x.v === hashes.view) {
+      delete out.view;
+      same.push('v');
+    }
+    if (same.length) out.same = same.join('');
+    return out;
   }
 
   publishNow(reason) {
@@ -929,13 +1124,21 @@ export class Bridge {
       nextSig: raise ? sig + 1 : counter,
       ack: c ? { ui: c.ui, seq: c.seq } : undefined,
       key: this.stripKeys.hex,
-      ...snapshot,
     };
     const targets = new Set([1, 2, 3]);
     for (let i = from; i <= to; i++) targets.add(i);
+    // Slots 1–3 are what a /reload bootstraps from, so they always carry everything.
+    // The rest can leave out what the addon says it already has, which keeps a 60 KB
+    // transcript off the disk (and out of Lua's parser) when it hasn't changed.
+    const bootstrap = [...targets].filter((i) => i <= 3);
+    const rotating = [...targets].filter((i) => i > 3);
     let bytes = 0;
     try {
-      bytes = this.bank.write([...targets], content);
+      bytes = this.bank.write(bootstrap, { ...content, ...snapshot });
+      if (rotating.length) {
+        const slim = Bridge.slimSnapshot(snapshot, c?.hashes);
+        bytes = Math.max(bytes, this.bank.write(rotating, { ...content, ...slim }));
+      }
       if (raise) {
         for (const k of toRaise) this.bank.raise(k);
         this.persist.sigCounter = Math.max(counter, sig + 1);
@@ -943,8 +1146,36 @@ export class Bridge {
         this.persist.slotGuess = predicted + 1;
       }
     } catch (err) {
-      this.log(`publish failed: ${err.message}`);
+      if (err instanceof FileInUse) {
+        if (Date.now() - (this.inUseLoggedAt || 0) >= 30000) {
+          this.inUseLoggedAt = Date.now();
+          this.log(`update waiting: ${err.message}`);
+        }
+        this.lastDigest = null;
+        this.lastPublishAt = Date.now();
+        this.markDirty('important');
+        return false;
+      }
+      // Any other failed write: back off and keep the update queued; log the first
+      // failure only, then the recovery.
+      const f = this.failures || (this.failures = { count: 0, since: Date.now() });
+      f.count++;
+      f.retryAt = Date.now() + Math.min(4000, 250 * 2 ** (f.count - 1));
+      this.dirty.important = true;
+      if (f.count === 1) this.log(`publish failed: ${err.message}; retrying`);
       return false;
+    }
+    if (this.failures) {
+      const { count, since } = this.failures;
+      this.failures = null;
+      this.log(`publish recovered after ${count} failed ${count === 1 ? 'try' : 'tries'} (${((Date.now() - since) / 1000).toFixed(1)}s)`);
+    }
+    // This publish carried a part the addon didn't say it had. Whether it applied it is
+    // unknown until it speaks again, so don't leave that part out on a guess: if it
+    // moves back to content the addon last reported, it must be sent, not assumed.
+    if (c?.hashes) {
+      if (c.hashes.view && snapshot.x.v !== c.hashes.view) c.hashes.view = null;
+      if (c.hashes.projects && snapshot.x.p !== c.hashes.projects) c.hashes.projects = null;
     }
     for (const r of this.results) r.sent = true;
     this.lastGen = gen;

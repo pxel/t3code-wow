@@ -91,18 +91,21 @@ local DEFAULTS = {
 		autoRead = false,
 		project = "all",
 		quickReplies = true,
-		collapsed = { settled = true },
+		collapsed = { snoozed = true, settled = true },
 		strip = true,
 		trackerLocked = true,
 		trackerAlways = true,
 		gameMenu = true,
 		minimapButton = true,
 		dictateSend = false,
+		steerFollowUps = true,
 		quietInstances = true,
 		windowScale = "auto",
 		padChord = "auto",
 	},
 	drafts = {},
+	models = {}, -- project id -> the model last picked for new threads there
+	efforts = {}, -- project id -> the reasoning level last picked for new threads there
 	cmdId = 0,
 	sigNext = 1,
 	gen = 0,
@@ -148,6 +151,14 @@ function ns.Duration(seconds)
 	if m < 60 then return string.format("%dm %02ds", m, seconds % 60) end
 	local h = math.floor(m / 60)
 	return string.format("%dh %02dm", h, m % 60)
+end
+
+-- When a snoozed thread comes back: the time, with the day when it isn't today.
+function ns.Until(epoch)
+	if not epoch then return "" end
+	local clock = (date("%I:%M %p", epoch):gsub("^0", ""))
+	if date("%Y%j", epoch) == date("%Y%j") then return clock end
+	return date("%a ", epoch) .. clock
 end
 
 function ns.Ago(epoch)

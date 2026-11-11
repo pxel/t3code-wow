@@ -9,13 +9,15 @@ ns.ThreadList = L
 local LIST_W_DEFAULT = 280
 
 local GROUPS = {
-	{ key = "working", label = "Working" },
 	{ key = "open", label = "Open" },
+	{ key = "working", label = "Working" },
+	{ key = "snoozed", label = "Snoozed" },
 	{ key = "settled", label = "Settled" },
 }
 
 local DOT_COLORS = {
 	working = { 0.29, 0.62, 1 },
+	waiting = { 0.55, 0.6, 0.7 },
 	input = { 1, 0.6, 0.2 },
 	plan = { 1, 0.6, 0.2 },
 	failed = { 1, 0.25, 0.25 },
@@ -87,7 +89,10 @@ local function CreateRow(button)
 		GameTooltip:AddLine(ns.Store:ProjectName(t.p), 0.7, 0.7, 0.7)
 		GameTooltip:AddLine(t.l or ns.Store.StatusText(t.s), 1, 1, 1, true)
 		if t.br then GameTooltip:AddLine("Branch: " .. t.br, 0.6, 0.8, 1) end
-		if t.m then GameTooltip:AddLine(t.m, 0.6, 0.6, 0.6) end
+		if t.m then
+			local label = t.mi and ns.Store:ModelLabel(ns.Store.EnvOf(t.id), ns.Store.ModelKey(t.mi, t.m)) or t.m
+			GameTooltip:AddLine(label, 0.6, 0.6, 0.6)
+		end
 		if t.last then
 			GameTooltip:AddLine(" ")
 			GameTooltip:AddLine(t.last, 0.9, 0.9, 0.9, true)
@@ -104,7 +109,7 @@ local function InitRow(button, ed)
 	button.thread = t
 	button.Selected:SetShown(t.id == ns.viewId and ns.Main.mode ~= "new")
 	button.Title:SetText(t.title)
-	if t.s == "settled" then
+	if t.s == "settled" or t.s == "snoozed" then
 		button.Title:SetTextColor(0.75, 0.75, 0.75)
 	else
 		button.Title:SetTextColor(NORMAL_FONT_COLOR:GetRGB())
@@ -114,10 +119,12 @@ local function InitRow(button, ed)
 	if color then button.Dot:SetVertexColor(color[1], color[2], color[3]) end
 	button.Status:SetText(ns.Color(ns.Store.StatusColor(t.s), ns.Store.StatusText(t.s)))
 	local sub = ns.Store:ProjectName(t.p)
-	if t.s == "working" or t.s == "input" then sub = t.l or sub end
+	if t.s == "working" or t.s == "input" or t.s == "waiting" then sub = t.l or sub end
 	button.Sub:SetText(sub)
-	if t.s == "working" and t.st then
+	if (t.s == "working" or t.s == "waiting") and t.st then
 		button.Age:SetText(ns.Duration(time() - t.st))
+	elseif t.s == "snoozed" then
+		button.Age:SetText(ns.Until(t.w))
 	else
 		button.Age:SetText(ns.Ago(t.u))
 	end
@@ -200,10 +207,12 @@ end
 function L:Refresh(force)
 	if not self.scrollBox then return end
 	local s = ns.db.settings
+	-- Settings saved before there was a Snoozed group: start it folded, like Settled.
+	if s.collapsed.snoozed == nil then s.collapsed.snoozed = true end
 	if s.project ~= "all" and not s.project:find("^m:") and not ns.Store.projectsById[s.project] and ns.Store.applied > 0 then s.project = "all" end
 	local key = table.concat({
-		ns.Store.applied, s.project, tostring(s.collapsed.working), tostring(s.collapsed.open),
-		tostring(s.collapsed.settled), tostring(ns.viewId), ns.Main.mode, self.query or "",
+		ns.Store.listKey or "", s.project, tostring(s.collapsed.working), tostring(s.collapsed.open),
+		tostring(s.collapsed.snoozed), tostring(s.collapsed.settled), tostring(ns.viewId), ns.Main.mode, self.query or "",
 	}, ":")
 	if key == self.key and not force then
 		-- Only timers changed: refresh the visible rows in place.
@@ -220,7 +229,7 @@ function L:Refresh(force)
 	for _, g in ipairs(GROUPS) do
 		local list = groups[g.key]
 		local collapsed = s.collapsed[g.key]
-		if #list > 0 or g.key ~= "settled" then
+		if #list > 0 or (g.key ~= "settled" and g.key ~= "snoozed") then
 			dp:Insert({ header = true, key = g.key, label = g.label, count = #list, collapsed = collapsed })
 			if not collapsed then
 				for _, t in ipairs(list) do dp:Insert({ thread = t }) end

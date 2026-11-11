@@ -250,7 +250,12 @@ function T:Apply(data, bootstrap)
 		if fresh then db.gen = data.gen end
 		self.lastData = GetTime()
 		self.bridgeNow = data.now
+		local hadModels = ns.Store.modelsHash
 		ns.Store:Apply(data)
+		-- Tell the bridge we have the new list, or it keeps sending it with every update.
+		-- (A part dropped here needs no hello: the publish that dropped it carried a
+		-- different hash, and the bridge stops trusting the old one as it publishes.)
+		if ns.Store.modelsHash ~= hadModels then self:Touch() end
 	end
 	ns:Fire("LinkChanged")
 	return fresh
@@ -289,8 +294,18 @@ function T:Acknowledge(seq)
 end
 
 -- Queue a command for the bridge. Returns its id.
+-- A command that can't fit in a frame next to the hello would never go, and would
+-- hold up every command queued after it, so it's refused here. The hello grows after
+-- a command is queued (a thread picked, its hashes filled in), so leave room for that.
+local HELLO_GROWTH = 96
+
 function T:Send(verb, ...)
 	local db = ns.db
+	local rec = Codec.Record({ "C", (db.cmdId or 0) + 1, verb, ... })
+	if #self:Hello() + 1 + #rec + HELLO_GROWTH > Codec.MAX_PAYLOAD - Codec.SEAL_OVERHEAD then
+		ns.Print("That's too long to send from the game. Shorten it to about 2,000 characters and try again.")
+		return nil
+	end
 	db.cmdId = (db.cmdId or 0) + 1
 	local cmd = { id = db.cmdId, verb = verb, args = { ... }, at = GetTime() }
 	table.insert(self.queue, cmd)
@@ -311,13 +326,19 @@ function T:Flags()
 	return f
 end
 
-function T:Payload()
+function T:Hello()
 	local db = ns.db
 	-- Without keys, only a bare hello (no thread id) so the bridge sends them.
-	local hello = Codec.Record({
+	return Codec.Record({
 		"H", 1, db.session, ns.ui, self.slotCursor, db.sigNext or 1, db.gen or 0,
 		self:Flags(), link and ns.viewId or "", ns.version, self.slotCount,
+		ns.Store.modelsHash or "", link and ns.Store.listKey or "", link and ns.Store.projectsKey or "",
+		link and ns.Store.viewKey or "",
 	})
+end
+
+function T:Payload()
+	local hello = self:Hello()
 	if not link then return hello end
 	local limit = Codec.MAX_PAYLOAD - Codec.SEAL_OVERHEAD
 	local parts, size = { hello }, #hello

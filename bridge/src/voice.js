@@ -1,6 +1,7 @@
 // Text-to-speech and dictation on the desktop side.
 //
-// Speech: a configured command, else speech-dispatcher (`spd-say`), else espeak-ng.
+// Speech: a configured command, else speech-dispatcher (`spd-say`), else espeak-ng,
+// else macOS's `say`.
 // Dictation: record the mic with pw-record and transcribe with `voxtype transcribe`;
 // the bridge sends the text to the addon. Without those, fall back to Omarchy's
 // `omarchy-dictation`, which pastes into the focused window.
@@ -18,7 +19,7 @@ const EXTRA_PATHS = [
 ];
 
 export function which(bin) {
-  for (const dir of [...(process.env.PATH || '').split(':'), ...EXTRA_PATHS]) {
+  for (const dir of [...(process.env.PATH || '').split(path.delimiter), ...EXTRA_PATHS]) {
     if (!dir) continue;
     const p = path.join(dir, bin);
     try {
@@ -44,6 +45,8 @@ export class Voice {
     if (spd) return { kind: 'spd', cmd: spd };
     const espeak = which('espeak-ng') || which('espeak');
     if (espeak) return { kind: 'espeak', cmd: espeak };
+    const say = process.platform === 'darwin' && which('say');
+    if (say) return { kind: 'say', cmd: say };
     return null;
   }
 
@@ -52,7 +55,19 @@ export class Voice {
     const dictation = this.canOmarchyDictate()
       ? `omarchy-dictation (${this.backendName() || 'no backend set'})`
       : this.canTranscribe() ? 'voxtype' : null;
-    return { tts: e ? (e.kind === 'custom' ? 'custom' : path.basename(e.cmd)) : null, dictation };
+    return {
+      tts: e ? (e.kind === 'custom' ? 'custom' : path.basename(e.cmd)) : null,
+      dictation,
+      // What to tell the player when there is nothing to dictate with; Omarchy's
+      // dictation setup only exists on Linux.
+      hint: dictation ? null : this.dictationHint(),
+    };
+  }
+
+  dictationHint(platform = process.platform) {
+    if (platform === 'darwin') return "Dictation isn't available on macOS yet.";
+    if (platform === 'win32') return "Dictation isn't available on Windows yet.";
+    return 'No dictation backend found; pick one in Omarchy > Setup > Defaults > Dictation.';
   }
 
   hush() {
@@ -77,11 +92,17 @@ export class Voice {
     this.hush();
     let child;
     if (engine.kind === 'custom') {
-      child = spawn('/bin/sh', ['-c', engine.cmd], { stdio: ['pipe', 'ignore', 'ignore'] });
+      child = spawn(engine.cmd, { shell: true, stdio: ['pipe', 'ignore', 'ignore'] });
       child.stdin.end(text);
     } else if (engine.kind === 'spd') {
       const args = ['--wait', '-e'];
       if (this.rate) args.push('-r', String(this.rate));
+      child = spawn(engine.cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+      child.stdin.end(text);
+    } else if (engine.kind === 'say') {
+      // Reads the text from stdin; -r is words per minute (the system default is ~175).
+      const args = ['-f', '-'];
+      if (this.rate) args.push('-r', String(175 + this.rate));
       child = spawn(engine.cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
       child.stdin.end(text);
     } else {
